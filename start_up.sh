@@ -7,6 +7,8 @@ helper_server="${helper#*@}"
 ssh-keyscan "$helper_server" > /tmp/helper_key
 ssh-keygen -lf /tmp/helper_key 1>/dev/null 2>&1
 rm /tmp/helper_key 1>/dev/null 2>&1
+# clean up possible existing inventory
+[ -f /root/inventory ] && rm -f /root/inventory
 # add key in helper
 ssh-copy-id "$helper"
 # get and call needle script
