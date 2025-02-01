@@ -12,4 +12,4 @@ ssh-copy-id "$helper"
 # get and call needle script
 scp "$helper:downloads/helper/starter/scripts/start.sh" .
 chmod +x ./start.sh
-./start.sh "$helper" &
+./start.sh "$helper"
