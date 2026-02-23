@@ -3,6 +3,8 @@ reset
 read -p "helper: " helper
 # get helper server
 helper_server="${helper#*@}"
+# write helper to file
+echo "$helper" > /root/helper
 # get unknown host keys in silence
 ssh-keyscan "$helper_server" > /tmp/helper_key
 ssh-keygen -lf /tmp/helper_key 1>/dev/null 2>&1
