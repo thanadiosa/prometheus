@@ -20,4 +20,3 @@ ssh-copy-id "$helper" 1>/dev/null 2>&1
 scp "$helper:downloads/helper/starter/scripts/start.sh" .
 chmod +x ./start.sh
 ./start.sh "$helper"
-rm "$0"
