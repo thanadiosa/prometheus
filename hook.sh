@@ -3,7 +3,7 @@
 # hook.sh — prometheus bootstrap, stage 1 (PUBLIC).
 #
 # Run on a bare Proxmox host console:
-#   curl -fsSL https://raw.githubusercontent.com/parrhasia/prometheus/main/bootstrap/hook.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/thanadiosa/prometheus/main/hook.sh | bash
 #
 # Stage 1 is tiny and stable: establish SSH access to the helper (SFTP) server,
 # fetch the needle (stage 2), run it. All address-specific logic lives in the
