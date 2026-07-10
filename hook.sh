@@ -14,7 +14,7 @@ reset
 
 # Path on the helper; PROVISIONER_REMOTE_DIR overrides the root for a confined-writes
 # helper (must match genesis.sh / needle.sh / control-boot.sh / run-pipeline.sh).
-NEEDLE_REMOTE="${PROVISIONER_REMOTE_DIR:-downloads/persistent/helper/starter}/scripts/start.sh"
+NEEDLE_REMOTE="${PROVISIONER_REMOTE_DIR:-downloads/helper/persistent}/scripts/start.sh"
 HELPER_CACHE="/root/helper"                                 # caches user@host
 
 log() { printf '\n[hook] %s\n' "$*" >&2; }
