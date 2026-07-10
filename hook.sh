@@ -27,7 +27,10 @@ while :; do
     helper=$(cat "$HELPER_CACHE")
     log "using cached helper ($helper)"
   else
-    read -r -p "helper (user@host): " helper
+    # Read from /dev/tty explicitly: the documented entrypoint is `curl … | bash`, so
+    # stdin is the pipe, not the console — a plain `read` gets EOF and spins the loop
+    # ("expected user@host" repeating). /dev/tty is the operator's console (as needle does).
+    read -r -p "helper (user@host): " helper </dev/tty
   fi
 
   if [[ -z $helper || $helper != *@* ]]; then
@@ -37,8 +40,11 @@ while :; do
   fi
   helper_server="${helper#*@}"
 
-  # Reachability pre-check → fast, clear failure.
-  if ! nc -z -w 5 "$helper_server" 22 2>/dev/null; then
+  # Reachability pre-check → fast, clear failure. Use bash's built-in /dev/tcp so we
+  # depend on NO external tool — `nc` is NOT installed on a freshly-imaged PVE host, and
+  # `nc -z` there fails "command not found" → a false "unreachable" on a perfectly good
+  # helper (observed on the epimetheus reinstall, 2026-07-10).
+  if ! timeout 5 bash -c "exec 3<>/dev/tcp/${helper_server}/22" 2>/dev/null; then
     log "helper unreachable on :22 — re-enter"
     rm -f "$HELPER_CACHE"
     continue
