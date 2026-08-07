@@ -26,6 +26,7 @@ _RD="${PROVISIONER_REMOTE_DIR:-}"
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
 NEEDLE_REMOTE="${SCRIPTS_REMOTE}/start.sh"          # needle.sh, deployed as start.sh
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib
+STORAGE_LIB_REMOTE="${SCRIPTS_REMOTE}/pve-storage-detect.sh"  # shared VM-disk storage resolver (needle sources it)
 HELPER_CACHE="/root/helper"                         # caches user@host
 PORT_CACHE="/root/helper-port"                      # caches the (non-22) helper port
 HELPER_PASS_FILE="/etc/provisioner/helper-pass"     # where the collected password lands (needle reads it)
@@ -162,6 +163,12 @@ export PROVISIONER_HELPER_ID="${PROVISIONER_HELPER_ID:-/root/.ssh/id_rsa}"
 
 log "fetching the needle via helper-lib"
 helper_get "$NEEDLE_REMOTE" ./needle.sh || { log "could not fetch the needle — aborting"; exit 1; }
+
+# needle sources the shared VM-disk storage resolver from its OWN dir (like helper-lib.sh),
+# so fetch it next to needle. genesis.sh deploys it to the helper scripts dir.
+log "fetching the storage resolver via helper-lib"
+helper_get "$STORAGE_LIB_REMOTE" ./pve-storage-detect.sh \
+  || { log "could not fetch pve-storage-detect.sh — aborting (re-run genesis deploy to stage it)"; exit 1; }
 
 # ── Hand off ──────────────────────────────────────────────────────────────────
 chmod +x ./needle.sh
