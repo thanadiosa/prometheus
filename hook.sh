@@ -540,6 +540,21 @@ log "fetching the storage resolver via helper-lib"
 helper_get "$STORAGE_LIB_REMOTE" ./pve-storage-detect.sh \
   || { log "could not fetch pve-storage-detect.sh — aborting (re-run genesis deploy to stage it)"; exit 1; }
 
+# The SPEC §16 notify primitive + its route table (issue #103) — BEST-EFFORT, never fatal.
+# Deliberately unlike the two fetches above: notifications are an optional convenience, and
+# a helper seeded before #103 landed simply does not have these files. Aborting the whole
+# cold start because the operator cannot be pinged would be exactly backwards. A miss here
+# means needle skips its emission and everything downstream behaves as it did before.
+log "fetching the notify primitive via helper-lib (optional)"
+if helper_get "${SCRIPTS_REMOTE}/notify.sh" ./notify.sh && [[ -s ./notify.sh ]]; then
+  chmod +x ./notify.sh 2>/dev/null || true
+  helper_get "${SCRIPTS_REMOTE}/notify-routes.default.tab" ./notify-routes.default.tab \
+    || log "no notify-routes.default.tab on the helper — notify would fall back to log-only (re-run genesis deploy to stage it)"
+else
+  rm -f ./notify.sh
+  log "no notify.sh on the helper — milestone notifications are OFF for this cold start (re-run genesis deploy to stage it); continuing"
+fi
+
 # ── Hand off ──────────────────────────────────────────────────────────────────
 chmod +x ./needle.sh
 log "running the needle"
