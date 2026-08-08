@@ -132,8 +132,11 @@ Nothing has been changed on this host."
   helper_server="${helper#*@}"; helper_ok=1
 
   # ── the port ────────────────────────────────────────────────────────────────
-  # env wins, else cache, else prompt (default 22 — the OpenSSH case; a seedbox helper is a
-  # high port like 14236). Threaded to needle so the whole chain agrees. Same single-use
+  # env wins, else cache, else prompt (default 22 — the OpenSSH case; a seedbox helper is
+  # typically a high port, e.g. 2222). NOTE: this file is served PUBLICLY from the raw
+  # mirror, so the example is deliberately generic — never paste a real estate's port here
+  # (issue #122; addressing is secret, SPEC §6). Threaded to needle so the whole chain
+  # agrees. Same single-use
   # rule as the address: a malformed env/cache value is consumed, never re-read.
   port=""; port_src=""
   if [[ -n ${PROVISIONER_HELPER_PORT:-} && $port_env_used == 0 ]]; then
