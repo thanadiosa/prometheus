@@ -233,6 +233,13 @@ Nothing has been changed on this host."
     continue     # the bad source is marked used — the next round reaches the prompt
   fi
 
+  # Name the helper on the console whenever the operator was NOT asked for it (#147).
+  # A repeat lap answers both questions from the cache/environment, so without this the
+  # run jumps straight to the PVE questions having silently chosen a helper — the
+  # operator asked to be told WHICH one it is about to use. Typed-in values need no
+  # echo: they were just entered.
+  [[ $helper_src != prompt ]] && say "using helper ${helper} on port ${port} (from ${helper_src})"
+
   # Reachability pre-check on the ACTUAL port → fast, clear failure. bash's built-in
   # /dev/tcp needs no external tool (`nc` is not on a fresh PVE host).
   if ! timeout 5 bash -c "exec 3<>/dev/tcp/${helper_server}/${port}" 2>/dev/null; then
