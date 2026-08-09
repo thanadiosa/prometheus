@@ -326,6 +326,50 @@ sftp_opts=(-o PreferredAuthentications=password -o PubkeyAuthentication=no
            -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=accept-new
            -o ConnectTimeout=15 "${cm_opts[@]}" -P "$port")
 
+# An OPERATOR-DECLARED helper key (issue #156). The key probe below otherwise authenticates
+# with OpenSSH's DEFAULT identity set (~/.ssh/id_ed25519, id_ecdsa, id_rsa, …) — which is
+# exactly why the hook has always worked against a key helper without being told which key
+# to use. A key at a NON-default path was therefore never actually offered, yet its path was
+# handed to the rest of the chain as if it had been. Offer it here, so that anything this
+# file later exports is something this file has SEEN WORK.
+#
+# `-i` REPLACES the default identity FILES; it does not add to them. Verified, not assumed:
+#     ssh -G -F /dev/null host             → identityfile ~/.ssh/id_rsa … id_ed25519 …
+#     ssh -G -F /dev/null -i /tmp/k host   → identityfile /tmp/k          (defaults GONE)
+# readconf appends the defaults only when num_identity_files == 0, and omitting
+# IdentitiesOnly does NOT restore the file defaults — it only leaves AGENT keys eligible.
+# (An earlier draft of this comment claimed `-i` was additive and therefore harmless. It is
+# not, and asserting an unchecked behaviour is the exact sin this change exists to remove.)
+#
+# So the skip below — no `-i` for a path ssh would offer anyway — is LOAD-BEARING, not a
+# tidy-up that merely avoids a duplicate offer: declaring a DEFAULT identity would otherwise
+# NARROW the probe to that one key and stop the other defaults being tried at all.
+# Non-existent ⇒ not offered and said out loud — `-i <missing file>` is not an error to ssh,
+# it is silently nothing.
+# The default identity names, in OpenSSH's own order. Used twice: to skip a redundant `-i`
+# for a key ssh would offer anyway, and to identify a sole local identity further down.
+# id_xmss is in OpenSSH 9.2's default list (confirmed via `ssh -G`), so it belongs here even
+# though XMSS is compile-time-optional and effectively unused — omitting it would let a
+# declared ~/.ssh/id_xmss skip the dedupe and narrow the probe to itself.
+HOOK_DEFAULT_IDS=(id_rsa id_ecdsa id_ecdsa_sk id_ed25519 id_ed25519_sk id_xmss id_dsa)
+key_id_opt=()
+if [[ -n ${PROVISIONER_HELPER_ID:-} ]]; then
+  if [[ ! -f ${PROVISIONER_HELPER_ID} || ! -r ${PROVISIONER_HELPER_ID} ]]; then
+    say "PROVISIONER_HELPER_ID='${PROVISIONER_HELPER_ID}' does not exist (or is unreadable) on this host — it cannot be offered to the helper; falling back to the default SSH identities"
+  else
+    # Already in the default set ⇒ ssh offers it regardless, and a second `-i` for the same
+    # file would put a DUPLICATE pubkey attempt in the session. Every attempt is one the
+    # helper's provider can count toward a ban (#87/#90), so we add exactly none we do not
+    # need.
+    _declared_is_default=0
+    for _n in "${HOOK_DEFAULT_IDS[@]}"; do
+      [[ ${PROVISIONER_HELPER_ID} == "${HOME:-/root}/.ssh/${_n}" ]] && { _declared_is_default=1; break; }
+    done
+    (( _declared_is_default )) || key_id_opt=(-i "${PROVISIONER_HELPER_ID}")
+    unset _n _declared_is_default
+  fi
+fi
+
 # The hook is PRE-LIB, so it carries the smallest possible copy of helper-lib's password
 # transport (issue #104): SSH_ASKPASS + SSH_ASKPASS_REQUIRE=force, which OpenSSH >= 8.4 uses
 # for password input regardless of tty or DISPLAY. The generated askpass program holds NO
@@ -458,6 +502,85 @@ classify_ssh_failure() {   # <output> <rc> → envfault|hostkey|auth|banned|miss
   printf 'unknown'
 }
 
+# ── WHICH identity actually authenticated (issue #156) ────────────────────────────────
+# THE DEFECT THIS EXISTS TO STOP. The key probe below authenticates with OpenSSH's DEFAULT
+# identity set — plain `scp`, no `-i` — so ssh offers ~/.ssh/id_ed25519, id_ecdsa, id_rsa …
+# in turn until one is accepted. That is WHY a cold start against a key helper works without
+# the operator naming a key. The hook then used to export a HARDCODED GUESS
+# (`/root/.ssh/id_rsa`) as PROVISIONER_HELPER_ID, which needle.sh and control-boot.sh inherit
+# and helper-lib.sh uses as `-i "$HELPER_KEY" -o IdentitiesOnly=yes`. IdentitiesOnly DISABLES
+# the very default-identity mechanism that had just succeeded — so the chain proved one key
+# works and then instructed everything downstream to use a DIFFERENT key that may not exist,
+# failing late with an error naming a path the operator never created. Same family as #143 /
+# #146: asserting a cause that was never established.
+#
+# THE RULE: never export a credential path that has not been verified. A wrong path is WORSE
+# than none, because IdentitiesOnly turns the guess into the only option, while no value at
+# all lets helper-lib apply its own default.
+#
+# So we READ THE WINNER OFF THE SUCCESSFUL PROBE. `scp -v` narrates the pubkey conversation:
+#     debug1: Offering public key: /root/.ssh/id_ed25519 ED25519 SHA256:…
+#     debug1: Server accepts key: /root/.ssh/id_ed25519 ED25519 SHA256:…
+# "Server accepts key" is the definitive line (printed only for the key the server said yes
+# to); the last "Offering public key" is the fallback, because on a SUCCESSFUL auth the last
+# key offered is the one that was accepted. Older OpenSSH words these differently
+# ("Offering RSA public key: <path>", and a pathless "Server accepts key: pkalg …"), so
+# rather than pin one format we scan the line for a WHITESPACE-SEPARATED token that is an
+# absolute path to a file that EXISTS AND IS READABLE HERE. That rejects "pkalg",
+# rejects agent-only identities (which have no local file to hand downstream), and keeps
+# working across wordings. It costs NO extra login: `-v` only changes what the probe we
+# already run says about itself.
+hook_verified_id=""       # the identity the probe was OBSERVED to authenticate with
+hook_verified_how=""      # observed | inferred  (empty ⇒ nothing established)
+
+# Scan the matching lines of an `ssh -v` transcript for a usable local key path. LAST match
+# wins: on success the accepted key is the last one the client offered.
+# <transcript> <marker>  → prints the path, or nothing.
+_hook_id_scan() {
+  local line tok found=""
+  while IFS= read -r line; do
+    case "$line" in *"$2"*) ;; *) continue;; esac
+    # Deliberately unquoted: we are word-splitting the tail of the debug line on purpose.
+    # shellcheck disable=SC2086
+    for tok in ${line#*"$2"}; do
+      [[ $tok == /* && -f $tok && -r $tok ]] || continue
+      found="$tok"
+    done
+  done <<<"$1"
+  [[ -n $found ]] && printf '%s' "$found"
+}
+
+# When the transcript names nothing usable (an OpenSSH too old to print the path, a
+# reworded release), fall back to a fact that needs no transcript at all: a pubkey auth
+# that SUCCEEDED used one of the identities present on this host, so if there is exactly
+# ONE of them there is nothing left to guess. Zero extra logins — this only reads the disk.
+# Two or more ⇒ we genuinely do not know, and per the rule above we then export NOTHING.
+_hook_sole_local_identity() {
+  local d="${HOME:-/root}/.ssh" n found="" count=0
+  for n in "${HOOK_DEFAULT_IDS[@]}"; do
+    [[ -f "${d}/${n}" && -r "${d}/${n}" ]] || continue
+    found="${d}/${n}"; count=$((count + 1))
+  done
+  (( count == 1 )) && printf '%s' "$found"
+}
+
+# Called ONLY on a probe that returned 0 — i.e. a key really did authenticate.
+hook_note_verified_id() {   # <scp -v transcript>
+  hook_verified_id="$(_hook_id_scan "$1" 'Server accepts key: ')"
+  [[ -z $hook_verified_id ]] && hook_verified_id="$(_hook_id_scan "$1" 'public key: ')"
+  if [[ -n $hook_verified_id ]]; then hook_verified_how=observed; return 0; fi
+  # Nothing named in the transcript. Inferring "the only identity on the box" is only sound
+  # when the probe offered exactly the default set. If a DECLARED key was offered (-i), it
+  # replaced those defaults, so the winner was the declared key — inferring some other local
+  # file would name a key that was never offered. Leave it unestablished instead: the export
+  # block then passes the declared value through and says plainly that this file did not
+  # verify it. Honest and unresolved beats confident and wrong.
+  if (( ${#key_id_opt[@]} )); then return 0; fi
+  hook_verified_id="$(_hook_sole_local_identity)"
+  [[ -n $hook_verified_id ]] && hook_verified_how=inferred
+  return 0
+}
+
 fetch_fail_reason=""    # human-readable "why" for the last fetch_lib failure
 banner_closes=0         # how many times the helper hung up on us (see the 'banned' class)
 fetch_lib() {
@@ -477,11 +600,19 @@ fetch_lib() {
   #     helper ACCEPTS an RSA /root/.ssh/id_rsa then HANGS verifying the signature, and
   #     ConnectTimeout does NOT bound that post-auth hang — without this the WHOLE cold-start
   #     wedges here (confirmed rc=124) instead of falling through to the password path (b).
+  #     `-v` is there ONLY so the transcript names the identity that won (issue #156) — see
+  #     hook_note_verified_id. It adds no login, no round trip and no prompt; the transcript
+  #     is captured into $out exactly as before and is never printed (only classified), so
+  #     nothing about the helper's coordinates reaches the console because of it.
   if [[ $auth_hint != password ]]; then
     out="$(timeout "${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}" \
-      scp -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes "${cm_opts[@]}" \
+      scp -v -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes \
+        "${cm_opts[@]}" "${key_id_opt[@]}" \
         "${helper}:${LIB_REMOTE}" ./helper-lib.sh 2>&1)"; rc=$?
-    [[ $rc -eq 0 && -s ./helper-lib.sh ]] && return 0
+    if [[ $rc -eq 0 && -s ./helper-lib.sh ]]; then
+      hook_note_verified_id "$out"     # read the winner off the conversation that just worked
+      return 0
+    fi
     rm -f ./helper-lib.sh
     # A key rejection here is EXPECTED on a password-only helper — never fatal on its own;
     # it just means we fall through to (b). Remember it only for the error message.
@@ -599,9 +730,50 @@ echo "$helper" > "$HELPER_CACHE"
 # file; it auto-detects auth (key vs password) and channel (exec vs SFTP-only).
 export HELPER="$helper"
 export PROVISIONER_HELPER_PORT="$port"
-# The PVE host's baked helper key (issue #61) for the lib's KEY probe; a password helper
-# rejects it and the lib falls back to the password file collected above.
-export PROVISIONER_HELPER_ID="${PROVISIONER_HELPER_ID:-/root/.ssh/id_rsa}"
+# The PVE host's helper key for the lib's KEY probe — the identity THIS RUN WATCHED
+# AUTHENTICATE, never a guess (issue #156). See hook_note_verified_id for the whole story;
+# the short version is that helper-lib uses this value as `-i "$HELPER_KEY" -o
+# IdentitiesOnly=yes`, which SUPPRESSES the default-identity mechanism the probe above just
+# succeeded with — so an unverified value does not merely fail to help, it replaces something
+# that works with something that may not exist, and the failure surfaces two scripts later
+# naming a path the operator never created.
+#
+# Precedence, and why:
+#   1. what we OBSERVED / INFERRED from the successful probe — verified beats declared, and
+#      it is the only value here that carries evidence.
+#   2. an operator-set PROVISIONER_HELPER_ID, when nothing was established (the probe never
+#      ran because the helper is password-only, or the key path failed). Passing it through
+#      unchanged is what this line has always done; we simply no longer INVENT one.
+#   3. nothing at all — leave the variable unset so helper-lib applies ITS default
+#      (/root/.ssh/id_ed25519). "Unset" is strictly better than a wrong path: helper-lib's
+#      own guard skips key auth when the file does not exist and says so, whereas a wrong
+#      path that DOES exist is offered as the only identity and is rejected.
+# There is now no default in THIS file, which is also what stops it and helper-lib from ever
+# disagreeing about one.
+if [[ -n $hook_verified_id ]]; then
+  # Only claim the helper ACCEPTED something when we watched it happen. On the inferred
+  # branch nothing was observed to be accepted, so this wording would assert a fact that was
+  # never established — the #143/#146 rule, which this file must not break in its own new
+  # code. Inference is reported by the log() line below, which names `how`.
+  if [[ $hook_verified_how == observed \
+        && -n ${PROVISIONER_HELPER_ID:-} && ${PROVISIONER_HELPER_ID} != "$hook_verified_id" ]]; then
+    say "the helper accepted '${hook_verified_id}', not the declared PROVISIONER_HELPER_ID='${PROVISIONER_HELPER_ID}' — threading the one that actually authenticated"
+  fi
+  export PROVISIONER_HELPER_ID="$hook_verified_id"
+  log "helper key auth ${hook_verified_how} to use ${hook_verified_id} — threading it to the rest of the chain"
+elif [[ -n ${PROVISIONER_HELPER_ID:-} ]]; then
+  export PROVISIONER_HELPER_ID
+  log "no helper key identity was established this run — passing the declared PROVISIONER_HELPER_ID='${PROVISIONER_HELPER_ID}' through unchanged (this file did not verify it)"
+elif [[ $auth_hint == password ]]; then
+  log "helper auth is 'password' — no key was offered, so no key path is threaded (helper-lib will use its own default only if it ever needs one)"
+elif [[ -s $HELPER_PASS_FILE ]]; then
+  log "the helper answered the PASSWORD, not a key — no key path is threaded"
+else
+  # Key auth WORKED and we still cannot name the identity. Rare (it needs an OpenSSH that
+  # prints no path AND two or more local identities), but it silently downgrades the rest of
+  # the chain to helper-lib's default, so it is said out loud rather than logged quietly.
+  say "key auth to the helper worked, but this host could not tell WHICH identity was accepted — not threading a key path. If a later stage cannot reach the helper, set PROVISIONER_HELPER_ID to the key that is authorized there and re-run."
+fi
 [[ -s $HELPER_PASS_FILE ]] && export PROVISIONER_HELPER_PASS_FILE="$HELPER_PASS_FILE"
 # Thread the durable auth fact both ways (issue #87/#90): PRELOAD it so the lib probes only
 # the auth we already know works (no doomed pubkey login on a password-only seedbox), and
