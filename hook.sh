@@ -51,8 +51,77 @@ HELPER_PASS_FILE="/etc/provisioner/helper-pass"     # where the collected passwo
 # them (issue #87/#90). Absent (first ever run) ⇒ unknown ⇒ behave as before.
 HELPER_AUTH_CACHE="/root/helper-auth"
 
-log() { printf '\n[hook] %s\n' "$*" >&2; }
-die() { printf '\n[hook] ERROR: %s\n' "$*" >&2; exit 1; }
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLE VERBOSITY — quiet by default, MOVED not deleted (issue #147)
+# ══════════════════════════════════════════════════════════════════════════════
+# Same contract as needle.sh's (the long version of the reasoning lives there): a normal
+# cold start shows the interview prompts and little else, and every line that leaves the
+# console is still RECORDED IN FULL — here by appending to the same durable run log needle
+# writes, /var/log/provisioner/needle.log, so one file holds the whole boot chain in order.
+# hook.sh runs BEFORE needle exists, so it cannot borrow needle's tee; it appends directly,
+# with the same knobs (PROVISIONER_NEEDLE_LOG / _DIR), the same 0700 dir + 0600 file
+# discipline, and the same "never a gate" rule — every write is best-effort.
+#   (Edge case, deliberately accepted: needle's size-triggered rotation runs at ITS start,
+#    so on the one lap that crosses the 4 MiB threshold these hook lines end up in
+#    needle.log.1 while the rest of the lap is in needle.log. Two generations, both kept.)
+#
+#   log()  — routine progress. Console only under PROVISIONER_VERBOSE=1; always recorded.
+#   say()  — the operator must see it (a rejected answer, a retry, a reason to act).
+#   die()  — fatal. Always both.
+# The rule for choosing: if the operator would need the line to know what to DO, it is
+# say()/die(). If it is us narrating, it is log().
+#
+# DEBUG MODE (restores the pre-#147 console verbatim):
+#     PROVISIONER_VERBOSE=1 bash <(curl -fsSL …/hook.sh)
+# It is exported below so needle.sh, which hook execs, inherits the same choice.
+case "${PROVISIONER_VERBOSE:-0}" in
+  1|true|TRUE|True|yes|YES|on|ON) HOOK_VERBOSE=1; export PROVISIONER_VERBOSE=1 ;;
+  *)                              HOOK_VERBOSE=0 ;;
+esac
+HOOK_LOG_DIR="${PROVISIONER_NEEDLE_LOG_DIR:-/var/log/provisioner}"
+# `-` not `:-`: an explicitly EMPTY PROVISIONER_NEEDLE_LOG disables the durable log, exactly
+# as it does in needle.sh, and must not silently fall back to the default path.
+HOOK_LOG="${PROVISIONER_NEEDLE_LOG-${HOOK_LOG_DIR}/needle.log}"
+
+# Append ONE UTC-stamped line. Never fatal: a read-only /var, no /var/log, a failed install
+# — the hook goes on exactly as before. It holds the helper coordinate, which is an address
+# and therefore secret (SPEC §6), so the dir is 0700 and the file 0600 and it never leaves
+# the box. Nothing on this path may pass a credential: the helper password is read with
+# `read -s` and written only to $HELPER_PASS_FILE.
+# RETURNS 1 when the line did NOT get recorded — that is what lets the quiet path fall back
+# to the console instead of losing it (see below).
+_hook_log_file() {
+  [[ -n ${HOOK_LOG:-} ]] || return 1
+  [[ -d ${HOOK_LOG%/*} ]] || install -d -m 0700 "${HOOK_LOG%/*}" 2>/dev/null || return 1
+  ( umask 077; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$HOOK_LOG" ) 2>/dev/null || return 1
+  chmod 0600 "$HOOK_LOG" 2>/dev/null || true
+  return 0
+}
+# The name helper-lib.sh looks for (issue #147): when the sourcing process defines
+# _prov_quiet_sink, the lib routes its routine chatter here instead of to the console. The
+# argument arrives already prefixed.
+# "Quiet" promises the detail is somewhere ELSE. If the durable log cannot be written (a
+# read-only /var, an explicitly empty PROVISIONER_NEEDLE_LOG) there IS nowhere else, so the
+# line goes to the console rather than vanishing — the one failure mode this change must not
+# have. Same rule as needle.sh's _prov_quiet_sink.
+_prov_quiet_sink() {
+  local rc=$?
+  if [[ $HOOK_VERBOSE == 1 ]]; then
+    printf '%s\n' "$*" >&2; _hook_log_file "$*"     # recorded in BOTH modes
+  else
+    _hook_log_file "$*" || printf '%s\n' "$*" >&2
+  fi
+  return $rc
+}
+
+# All three return 0 whatever the routing — several call sites sit in `||` chains.
+log() {
+  if [[ $HOOK_VERBOSE == 1 ]]; then printf '\n[hook] %s\n' "$*" >&2; _hook_log_file "[hook] $*"
+  else _hook_log_file "[hook] $*" || printf '\n[hook] %s\n' "$*" >&2; fi
+  return 0
+}
+say() { printf '\n[hook] %s\n' "$*" >&2; _hook_log_file "[hook] $*"; return 0; }
+die() { printf '\n[hook] ERROR: %s\n' "$*" >&2; _hook_log_file "[hook] ERROR: $*"; exit 1; }
 
 # Detect a controlling terminal ONCE, before anything asks (issue: iapetus wedge / #58).
 # The documented entrypoint is a console `curl|bash`, but the chain is also re-invoked with
@@ -65,6 +134,11 @@ have_tty=0; { : </dev/tty; } 2>/dev/null && have_tty=1
 # INTERVIEW — every question hook.sh will ever ask (issue #104). Nothing below
 # the "END OF INTERVIEW" marker prompts.
 # ══════════════════════════════════════════════════════════════════════════════
+# PROMPT WORDING (issue #147) — the operator specified these strings. On a quiet console
+# the prompts are essentially the entire transcript, so they are short. The format hint the
+# old "helper (user@host)" prompt carried has NOT been lost, it has moved to where it is
+# actually needed: a malformed answer is answered with say "expected user@host, try again"
+# and the loop re-asks.
 
 # ── Q1/Q2: helper (user@host) + port, cached across runs ──────────────────────
 # The loop re-asks on a bad or unreachable answer instead of forcing a one-liner restart.
@@ -111,7 +185,7 @@ Re-run the hook, or set PROVISIONER_HELPER=user@host and PROVISIONER_HELPER_PORT
     # pipe, not the console — a plain `read` gets EOF and spins the loop. A FAILED read
     # (the tty went away mid-run) is fatal, never a silent empty answer to loop on.
     helper=""
-    read -r -p "helper (user@host): " helper </dev/tty \
+    read -r -p "helper address: " helper </dev/tty \
       || die "lost the controlling terminal while asking for the helper address — set PROVISIONER_HELPER=user@host and re-run."
     helper_src="prompt"
   else
@@ -124,8 +198,8 @@ Nothing has been changed on this host."
   if [[ -z $helper || $helper != *@* ]]; then
     case "$helper_src" in
       env)   die "PROVISIONER_HELPER='${helper}' is not user@host — fix it and re-run. Nothing has been changed.";;
-      cache) log "cached helper '${helper}' is not user@host — discarding it and asking"; rm -f "$HELPER_CACHE";;
-      *)     log "expected user@host, try again";;
+      cache) say "cached helper '${helper}' is not user@host — discarding it and asking"; rm -f "$HELPER_CACHE";;
+      *)     say "expected user@host, try again";;
     esac
     continue     # the bad source is now marked used (and the cache file removed) — progress
   fi
@@ -144,7 +218,7 @@ Nothing has been changed on this host."
   elif [[ -f $PORT_CACHE && $port_cache_used == 0 ]]; then
     port="$(cat "$PORT_CACHE")"; port_src="cache"; port_cache_used=1
   elif [[ $have_tty == 1 ]]; then
-    read -r -p "helper SSH/SFTP port [22]: " port </dev/tty \
+    read -r -p "helper port [22]: " port </dev/tty \
       || die "lost the controlling terminal while asking for the helper port — set PROVISIONER_HELPER_PORT and re-run."
     port="${port:-22}"; port_src="prompt"
   else
@@ -153,8 +227,8 @@ Nothing has been changed on this host."
   if [[ ! $port =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
     case "$port_src" in
       env)   die "PROVISIONER_HELPER_PORT='${port}' is not a valid port number (1-65535) — fix it and re-run. Nothing has been changed.";;
-      cache) log "cached helper port '${port}' (${PORT_CACHE}) is not a valid port number — discarding it and asking"; rm -f "$PORT_CACHE";;
-      *)     log "port must be a number between 1 and 65535, try again";;
+      cache) say "cached helper port '${port}' (${PORT_CACHE}) is not a valid port number — discarding it and asking"; rm -f "$PORT_CACHE";;
+      *)     say "port must be a number between 1 and 65535, try again";;
     esac
     continue     # the bad source is marked used — the next round reaches the prompt
   fi
@@ -168,7 +242,7 @@ Nothing has been changed on this host."
     [[ $helper_src == env ]] && die "helper '${helper}' is unreachable on :${port} (TCP connect failed) and it came from PROVISIONER_HELPER — check the address/port/DNS and re-run. Nothing has been changed."
     [[ $port_src == env ]] && die "helper is unreachable on :${port} (TCP connect failed) and that port came from PROVISIONER_HELPER_PORT — check the address/port/DNS and re-run. Nothing has been changed."
     if [[ $have_tty == 1 ]]; then
-      log "helper unreachable on :${port} — re-enter"
+      say "helper unreachable on :${port} — re-enter"
       rm -f "$HELPER_CACHE" "$PORT_CACHE"
       helper_cache_used=1; port_cache_used=1     # belt-and-braces if the rm could not happen
       helper_ok=0                                # the address itself may be what is wrong
@@ -203,7 +277,7 @@ elif [[ $have_tty == 1 ]]; then
   if [[ $auth_hint == password ]]; then
     pw_prompt="helper password: "
   else
-    pw_prompt="helper password (leave EMPTY if the helper takes this host's SSH key): "
+    pw_prompt="helper password (empty for SSH key): "
   fi
   read -rsp "$pw_prompt" pw </dev/tty; printf '\n' >&2
   if [[ -n $pw ]]; then
@@ -506,7 +580,7 @@ this estate's IP banned by the helper's provider. Fix the cause and re-run the o
   if (( attempts >= max_attempts )); then
     die "could not fetch helper-lib.sh after ${attempts} attempts — ${fetch_fail_reason}"
   fi
-  log "retrying in 3s (attempt ${attempts}/${max_attempts}) — ${fetch_fail_reason}"
+  say "retrying in 3s (attempt ${attempts}/${max_attempts}) — ${fetch_fail_reason}"
   sleep 3
 done
 
@@ -532,13 +606,13 @@ export PROVISIONER_HELPER_AUTH_CACHE="${PROVISIONER_HELPER_AUTH_CACHE:-$HELPER_A
 . ./helper-lib.sh
 
 log "fetching the needle via helper-lib"
-helper_get "$NEEDLE_REMOTE" ./needle.sh || { log "could not fetch the needle — aborting"; exit 1; }
+helper_get "$NEEDLE_REMOTE" ./needle.sh || { say "could not fetch the needle — aborting"; exit 1; }
 
 # needle sources the shared VM-disk storage resolver from its OWN dir (like helper-lib.sh),
 # so fetch it next to needle. genesis.sh deploys it to the helper scripts dir.
 log "fetching the storage resolver via helper-lib"
 helper_get "$STORAGE_LIB_REMOTE" ./pve-storage-detect.sh \
-  || { log "could not fetch pve-storage-detect.sh — aborting (re-run genesis deploy to stage it)"; exit 1; }
+  || { say "could not fetch pve-storage-detect.sh — aborting (re-run genesis deploy to stage it)"; exit 1; }
 
 # The SPEC §16 notify primitive + its route table (issue #103) — BEST-EFFORT, never fatal.
 # Deliberately unlike the two fetches above: notifications are an optional convenience, and
