@@ -269,8 +269,20 @@ done
 # offer an explicit "leave empty" for the key case.
 mkdir -p /etc/provisioner
 auth_hint="${PROVISIONER_HELPER_AUTH:-}"
-[[ -z $auth_hint && -f $HELPER_AUTH_CACHE ]] && auth_hint="$(tr -d '[:space:]' < "$HELPER_AUTH_CACHE" 2>/dev/null)"
-case "$auth_hint" in key|password) ;; *) auth_hint="" ;; esac
+# PROVENANCE, not just the value (issue #157). These two sources look identical downstream and
+# mean opposite things: an ENV value is an operator DECLARING "this helper takes passwords,
+# never offer it a key" (helper-lib.sh documents PROVISIONER_HELPER_AUTH as exactly that pin),
+# while a CACHE value is only this chain's own memory of what worked last time. needle.sh's
+# one-time key-authorize (#157) must honour the first and is allowed to correct the second —
+# and it cannot tell them apart, because everything below collapses both into one variable.
+# So the distinction is recorded HERE, where it is still known, and threaded on.
+auth_hint_src=""
+[[ -n $auth_hint ]] && auth_hint_src='env'
+if [[ -z $auth_hint && -f $HELPER_AUTH_CACHE ]]; then
+  auth_hint="$(tr -d '[:space:]' < "$HELPER_AUTH_CACHE" 2>/dev/null)"
+  auth_hint_src='cache'
+fi
+case "$auth_hint" in key|password) ;; *) auth_hint=""; auth_hint_src="" ;; esac
 [[ -n $auth_hint ]] && log "helper auth known from a previous run: ${auth_hint}"
 
 # hook_collected_pass records whether the credential is OURS to discard on a failure:
@@ -779,7 +791,7 @@ fi
 # the auth we already know works (no doomed pubkey login on a password-only seedbox), and
 # point the lib's capture at the same PVE-host file so a first-ever run RECORDS it for the
 # next one. needle re-reads both from the environment / the cache file.
-[[ -n $auth_hint ]] && export PROVISIONER_HELPER_AUTH="$auth_hint"
+[[ -n $auth_hint ]] && export PROVISIONER_HELPER_AUTH="$auth_hint" PROVISIONER_HELPER_AUTH_SRC="$auth_hint_src"
 export PROVISIONER_HELPER_AUTH_CACHE="${PROVISIONER_HELPER_AUTH_CACHE:-$HELPER_AUTH_CACHE}"
 # shellcheck source=bootstrap/helper-lib.sh
 . ./helper-lib.sh
