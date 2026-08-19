@@ -4,9 +4,8 @@ reset
 
 _RD="${PROVISIONER_REMOTE_DIR:-}"
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
-NEEDLE_REMOTE="${SCRIPTS_REMOTE}/start.sh"          # needle.sh, deployed as start.sh
+NEEDLE_REMOTE="${SCRIPTS_REMOTE}/start.sh"          # needle-boot.sh (the pre-repo stub), deployed as start.sh
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib
-STORAGE_LIB_REMOTE="${SCRIPTS_REMOTE}/pve-storage-detect.sh"  # shared VM-disk storage resolver (needle sources it)
 HELPER_CACHE="/root/helper"                         # caches user@host
 PORT_CACHE="/root/helper-port"                      # caches the (non-22) helper port
 HELPER_PASS_FILE="/etc/provisioner/helper-pass"     # where the collected password lands (needle reads it)
@@ -429,11 +428,8 @@ export PROVISIONER_HELPER_AUTH_CACHE="${PROVISIONER_HELPER_AUTH_CACHE:-$HELPER_A
 . ./helper-lib.sh
 
 log "fetching the needle via helper-lib"
-helper_get "$NEEDLE_REMOTE" ./needle.sh || { say "could not fetch the needle — aborting"; exit 1; }
+helper_get "$NEEDLE_REMOTE" ./start.sh || { say "could not fetch the needle — aborting"; exit 1; }
 
-log "fetching the storage resolver via helper-lib"
-helper_get "$STORAGE_LIB_REMOTE" ./pve-storage-detect.sh \
-  || { say "could not fetch pve-storage-detect.sh — aborting (re-run genesis deploy to stage it)"; exit 1; }
 
 log "fetching the notify primitive via helper-lib (optional)"
 if helper_get "${SCRIPTS_REMOTE}/notify.sh" ./notify.sh && [[ -s ./notify.sh ]]; then
@@ -445,6 +441,6 @@ else
   log "no notify.sh on the helper — milestone notifications are OFF for this cold start (re-run genesis deploy to stage it); continuing"
 fi
 
-chmod +x ./needle.sh
+chmod +x ./start.sh
 log "running the needle"
-PROVISIONER_HELPER_PORT="$port" ./needle.sh "$helper"
+PROVISIONER_HELPER_PORT="$port" ./start.sh "$helper"
