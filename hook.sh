@@ -4,11 +4,19 @@ reset
 
 _RD="${PROVISIONER_REMOTE_DIR:-}"
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
-NEEDLE_REMOTE="${SCRIPTS_REMOTE}/start.sh"          # needle-boot.sh (the pre-repo stub), deployed as start.sh
-LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib
+SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
+LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib — the ONLY staged file we fetch
+DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy" # read-only GitHub credential (issue #10 shapes)
 HELPER_CACHE="/root/helper"                         # caches user@host
 PORT_CACHE="/root/helper-port"                      # caches the (non-22) helper port
-HELPER_PASS_FILE="/etc/provisioner/helper-pass"     # where the collected password lands (needle reads it)
+STATE_DIR="/etc/provisioner"                        # the boot chain's own 0700 state/secret dir
+HELPER_PASS_FILE="${STATE_DIR}/helper-pass"         # where the collected password lands (needle reads it)
+DEPLOY_KEY="${STATE_DIR}/github_deploy"             # the deploy key, once pulled (0600)
+GIT_ASKPASS_HELPER="${STATE_DIR}/git-askpass.sh"    # token mode only — keeps the PAT out of .git/config
+REPO_DIR="${PROVISIONER_REPO_DIR:-/opt/provisioner}"
+REPO_URL="git@github.com:parrhasia/prometheus.git"
+NEEDLE_MAIN="${REPO_DIR}/bootstrap/needle.sh"       # what we hand off to
+estate="${PROVISIONER_ESTATE:-$(hostname -s 2>/dev/null || true)}"
 HELPER_AUTH_CACHE="/root/helper-auth"
 
 case "${PROVISIONER_VERBOSE:-0}" in
@@ -40,8 +48,9 @@ log() {
   else _hook_log_file "[hook] $*" || printf '\n[hook] %s\n' "$*" >&2; fi
   return 0
 }
-say() { printf '\n[hook] %s\n' "$*" >&2; _hook_log_file "[hook] $*"; return 0; }
-die() { printf '\n[hook] ERROR: %s\n' "$*" >&2; _hook_log_file "[hook] ERROR: $*"; exit 1; }
+say()  { printf '\n[hook] %s\n' "$*" >&2; _hook_log_file "[hook] $*"; return 0; }
+warn() { printf '\n[hook] WARNING: %s\n' "$*" >&2; _hook_log_file "[hook] WARNING: $*"; return 0; }
+die()  { printf '\n[hook] ERROR: %s\n' "$*" >&2; _hook_log_file "[hook] ERROR: $*"; exit 1; }
 
 have_tty=0; { : </dev/tty; } 2>/dev/null && have_tty=1
 
@@ -80,7 +89,7 @@ Set it in the environment before invoking the hook:
   • PROVISIONER_HELPER_PORT=<port>      (optional, default 22)
 Nothing has been changed on this host."
   fi
-  if [[ -z $helper || $helper != *@* ]]; then
+  if [[ ! $helper =~ ^[A-Za-z0-9._@-]+@[A-Za-z0-9._-]+$ ]]; then
     case "$helper_src" in
       env)   die "PROVISIONER_HELPER='${helper}' is not user@host — fix it and re-run. Nothing has been changed.";;
       cache) say "cached helper '${helper}' is not user@host — discarding it and asking"; rm -f "$HELPER_CACHE";;
@@ -130,7 +139,7 @@ Nothing has been changed on this host."
   break
 done
 
-mkdir -p /etc/provisioner
+install -d -m 0700 "$STATE_DIR" || die "could not create ${STATE_DIR}"
 auth_hint="${PROVISIONER_HELPER_AUTH:-}"
 auth_hint_src=""
 [[ -n $auth_hint ]] && auth_hint_src='env'
@@ -169,6 +178,14 @@ else
   log "no controlling terminal and no staged helper password — KEY auth only (stage ${HELPER_PASS_FILE} 0600 if the helper is password-only)"
 fi
 
+
+[[ $EUID -eq 0 ]] || die "must run as root on the PVE host (the console one-liner runs as root; nothing has been changed)"
+for _bin in pveversion qm pvesm; do
+  command -v "$_bin" >/dev/null 2>&1 \
+    || die "'${_bin}' not found — this does not look like a Proxmox VE host. The bootstrap chain provisions a PVE hypervisor and nothing here will work on anything else. Nothing has been changed."
+done
+unset _bin
+log "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
 
 cm_opts=()
 [[ -n ${PROVISIONER_HELPER_CIPHERS-aes128-ctr} ]] && cm_opts+=(-o Ciphers="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}")
@@ -415,6 +432,9 @@ if [[ -n $hook_verified_id ]]; then
 elif [[ -n ${PROVISIONER_HELPER_ID:-} ]]; then
   export PROVISIONER_HELPER_ID
   log "no helper key identity was established this run — passing the declared PROVISIONER_HELPER_ID='${PROVISIONER_HELPER_ID}' through unchanged (this file did not verify it)"
+elif [[ -s /root/.ssh/id_provisioner_ed25519 ]]; then
+  export PROVISIONER_HELPER_ID="/root/.ssh/id_provisioner_ed25519"
+  log "no key identity was established this run, but the #61 per-install key exists — threading /root/.ssh/id_provisioner_ed25519 (this file did not verify it)"
 elif [[ $auth_hint == password ]]; then
   log "helper auth is 'password' — no key was offered, so no key path is threaded (helper-lib will use its own default only if it ever needs one)"
 elif [[ -s $HELPER_PASS_FILE ]]; then
@@ -425,22 +445,106 @@ fi
 [[ -s $HELPER_PASS_FILE ]] && export PROVISIONER_HELPER_PASS_FILE="$HELPER_PASS_FILE"
 [[ -n $auth_hint ]] && export PROVISIONER_HELPER_AUTH="$auth_hint" PROVISIONER_HELPER_AUTH_SRC="$auth_hint_src"
 export PROVISIONER_HELPER_AUTH_CACHE="${PROVISIONER_HELPER_AUTH_CACHE:-$HELPER_AUTH_CACHE}"
+export PROVISIONER_REMOTE_DIR="$_RD"
 . ./helper-lib.sh
 
-log "fetching the needle via helper-lib"
-helper_get "$NEEDLE_REMOTE" ./start.sh || { say "could not fetch the needle — aborting"; exit 1; }
 
+_log_prerepo_fingerprints() {
+  local f h out=""
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    log "pre-repo script fingerprints: no sha256sum on this host — skipping (issue #169)"
+    return 0
+  fi
+  for f in helper-lib.sh; do
+    if [[ -f "./${f}" ]]; then
+      h="$(sha256sum "./${f}" 2>/dev/null)" && h="${h%% *}" || h=""
+      out+=" ${f}=${h:0:12}"
+      [[ -n $h ]] || out+="unhashable"
+    else
+      out+=" ${f}=absent"
+    fi
+  done
+  log "pre-repo script fingerprints (sha256/12, as staged on the helper — issue #169):${out}"
+  return 0
+}
+_log_prerepo_fingerprints
 
-log "fetching the notify primitive via helper-lib (optional)"
-if helper_get "${SCRIPTS_REMOTE}/notify.sh" ./notify.sh && [[ -s ./notify.sh ]]; then
-  chmod +x ./notify.sh 2>/dev/null || true
-  helper_get "${SCRIPTS_REMOTE}/notify-routes.default.tab" ./notify-routes.default.tab \
-    || log "no notify-routes.default.tab on the helper — notify would fall back to log-only (re-run genesis deploy to stage it)"
+if helper_detect; then
+  log "helper reachable (auth=$(helper_auth), channel=$(helper_channel))"
 else
-  rm -f ./notify.sh
-  log "no notify.sh on the helper — milestone notifications are OFF for this cold start (re-run genesis deploy to stage it); continuing"
+  die "cannot reach helper '${helper}' on port ${port} — the deploy key and the seed images both live there, so nothing can proceed.
+Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them (issue #143).
+Nothing has been changed on this host."
 fi
 
-chmod +x ./start.sh
-log "running the needle"
-PROVISIONER_HELPER_PORT="$port" ./start.sh "$helper"
+if command -v git >/dev/null 2>&1; then
+  log "git already present ($(git --version 2>/dev/null || echo 'version unknown'))"
+else
+  log "installing git (absent on a stock PVE host — issue #169)"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null \
+    || die "could not install git, so this box cannot fetch the provisioner code (issue #169).
+The pre-repo phase needs exactly one package and this is it. Check apt on this host:
+  apt-get update ; apt-get install -y git
+A PVE host with no subscription 401s on the enterprise repo — that alone is harmless, the
+no-subscription repo carries git. Nothing has been provisioned (no VM, no user)."
+fi
+
+log "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
+if ! helper_get "$DEPLOY_KEY_REMOTE" "$DEPLOY_KEY"; then
+  rm -f "$DEPLOY_KEY"
+  die "could not pull the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE}) — see the [helper-lib] line above for the transport's own words.
+This box cannot clone the provisioner repo without it. Stage it on the helper (the same file control-boot.sh pulls for the control node) and re-run the hook. Nothing has been provisioned."
+fi
+[[ -s $DEPLOY_KEY ]] || { rm -f "$DEPLOY_KEY"; die "the deploy key fetched from ${DEPLOY_KEY_REMOTE} is EMPTY — re-stage it on the helper and re-run. Nothing has been provisioned."; }
+chmod 0600 "$DEPLOY_KEY"
+
+if head -c 64 "$DEPLOY_KEY" 2>/dev/null | grep -q -- '-----BEGIN'; then
+  log "github credential is an SSH key — cloning over SSH"
+  install -d -m 0700 /root/.ssh
+  ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+  export GIT_SSH_COMMAND="ssh -i ${DEPLOY_KEY} -o IdentitiesOnly=yes"
+else
+  log "github credential is a token — cloning over HTTPS"
+  printf '%s' "$(tr -d '[:space:]' < "$DEPLOY_KEY")" > "$DEPLOY_KEY"
+  REPO_URL="https://x-access-token@github.com/parrhasia/prometheus.git"
+  printf '#!/usr/bin/env bash\nexec cat %q\n' "$DEPLOY_KEY" > "$GIT_ASKPASS_HELPER"
+  chmod 0700 "$GIT_ASKPASS_HELPER"
+  export GIT_ASKPASS="$GIT_ASKPASS_HELPER" GIT_TERMINAL_PROMPT=0
+fi
+
+install -d -m 0755 "$(dirname "$REPO_DIR")" 2>/dev/null || true
+if [[ -d "${REPO_DIR}/.git" ]]; then
+  log "updating the provisioner checkout at ${REPO_DIR}"
+  git -C "$REPO_DIR" pull --ff-only \
+    || die "git pull failed for the existing checkout at ${REPO_DIR} (issue #169).
+A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
+else
+  log "cloning the provisioner repo into ${REPO_DIR}"
+  git clone "$REPO_URL" "$REPO_DIR" \
+    || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
+Since #169 the boot chain runs the REPO's code, so there is no staged copy to fall back to.
+Check, in this order:
+  • outbound network / DNS from this host to github.com
+  • the deploy key staged at ${DEPLOY_KEY_REMOTE} on the helper — is it still valid, and does it grant READ on parrhasia/prometheus?
+  • git's own words above
+Nothing has been provisioned (no VM, no user, no sshd change)."
+fi
+[[ -r $NEEDLE_MAIN ]] || die "the checkout at ${REPO_DIR} has no ${NEEDLE_MAIN#$REPO_DIR/} — either the clone is incomplete or this commit predates the #169 split. Remove ${REPO_DIR} and re-run the hook."
+
+REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || REPO_COMMIT=""
+REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || REPO_COMMIT_SHORT=""
+REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
+if [[ -n $REPO_COMMIT ]]; then
+  log "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — issue #169: this is the code this lap executes, not a copy staged on the helper"
+else
+  warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
+fi
+export PROVISIONER_REPO_DIR="$REPO_DIR"
+export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
+
+log "handing off to the checkout's needle: ${NEEDLE_MAIN}"
+_hook_log_file "[hook] ── end of the pre-repo phase; everything below runs from ${REPO_DIR} ──"
+exec /bin/bash "$NEEDLE_MAIN" "$helper" "$estate"
+
+die "could not exec ${NEEDLE_MAIN} — the checkout is present but unrunnable"
