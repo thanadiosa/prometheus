@@ -7,6 +7,7 @@ SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
 SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib — the ONLY staged file we fetch
 DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy" # read-only GitHub credential (issue #10 shapes)
+VERSION_REMOTE="${_RD:+${_RD}/}version"             # the per-estate version pointer (issue #232)
 HELPER_CACHE="/root/helper"                         # caches user@host
 PORT_CACHE="/root/helper-port"                      # caches the (non-22) helper port
 STATE_DIR="/etc/provisioner"                        # the boot chain's own 0700 state/secret dir
@@ -477,17 +478,89 @@ Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered p
 Nothing has been changed on this host."
 fi
 
-if command -v git >/dev/null 2>&1; then
-  log "git already present ($(git --version 2>/dev/null || echo 'version unknown'))"
+ref_is_sane() {
+  local r="${1:-}"
+  [[ -n $r ]] || return 1
+  [[ $r == *..* ]] && return 1
+  [[ $r =~ ^[A-Za-z0-9][A-Za-z0-9._/+-]{0,127}$ ]]
+}
+
+PROVISIONER_VERSION="${PROVISIONER_VERSION:-}"
+version_src=""
+if [[ -n $PROVISIONER_VERSION ]]; then
+  version_src="env"
 else
+  _ver_tmp="$(mktemp)" || _ver_tmp=""
+  if [[ -n $_ver_tmp ]] && helper_get "$VERSION_REMOTE" "$_ver_tmp" 2>/dev/null && [[ -s $_ver_tmp ]]; then
+    PROVISIONER_VERSION="$(head -n 1 "$_ver_tmp" | tr -d '[:space:]')"
+    version_src="helper"
+  fi
+  [[ -n $_ver_tmp ]] && rm -f "$_ver_tmp"
+  unset _ver_tmp
+fi
+
+case "$PROVISIONER_VERSION" in
+  newest|NEWEST) log "version pointer says 'newest' (from ${version_src}) — building the repo's default branch (issue #232)"; PROVISIONER_VERSION=""; version_src="" ;;
+esac
+
+version_where="the environment (PROVISIONER_VERSION)"
+[[ $version_src == helper ]] && version_where="the helper's version pointer (${VERSION_REMOTE})"
+if [[ -n $PROVISIONER_VERSION ]] && ! ref_is_sane "$PROVISIONER_VERSION"; then
+  die "$(printf 'the requested provisioner version %q is not a usable git ref (issue #232).' "$PROVISIONER_VERSION")
+It came from ${version_where}.
+A version is a tag, a branch, or a full commit sha: letters, digits and . _ / + - only, no
+leading '-', no '..', at most 128 characters.
+NOT falling back to the newest code: you asked for a specific version, and building a
+different one under that label is the exact failure this check exists to prevent.
+Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provisioned."
+fi
+
+if [[ -n $PROVISIONER_VERSION ]]; then
+  say "building provisioner version '${PROVISIONER_VERSION}' (from ${version_src})"
+else
+  log "no version pinned (${VERSION_REMOTE} absent or empty, and no PROVISIONER_VERSION) — building the newest code, as every lap before issue #232 did"
+fi
+
+HOOK_APT_LOCK_WAIT="${PROVISIONER_APT_LOCK_WAIT:-300}"
+
+HOOK_APT_LOCK_RE='could not get lock|unable to acquire the dpkg frontend lock|dpkg frontend lock|is another process using it|waiting for cache lock|unable to lock the administration directory'
+
+install_git() {
+  local out rc aptlog
+  [[ $HOOK_APT_LOCK_WAIT =~ ^[1-9][0-9]*$ ]] \
+    || die "PROVISIONER_APT_LOCK_WAIT must be a whole number of seconds, 1 or more (got '${HOOK_APT_LOCK_WAIT}'). It bounds how long apt may wait for the package-manager lock. apt reads a negative value as 'wait forever' — the hang issue #303 exists to prevent — and 0 is apt-get's fail-immediately default, which is the #303 bug itself."
   log "installing git (absent on a stock PVE host — issue #169)"
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null \
-    || die "could not install git, so this box cannot fetch the provisioner code (issue #169).
+  log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang (issue #303)."
+  aptlog="$(mktemp "${TMPDIR:-/tmp}/hook-apt.XXXXXX" 2>/dev/null || printf '%s/hook-apt.%s' "${TMPDIR:-/tmp}" "$$")"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" update -qq 2>&1 | tee "$aptlog" >&2
+  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"
+  (( rc == 0 )) \
+    || warn "apt-get update exited ${rc} — continuing to the install anyway (a subscription 401 is harmless here). First line back: $(printf '%s' "$out" | head -1)"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" install -y -qq git 2>&1 | tee "$aptlog" >&2
+  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"; rm -f "$aptlog"
+  (( rc == 0 )) && command -v git >/dev/null 2>&1 && return 0
+  if printf '%s' "$out" | grep -qiE "$HOOK_APT_LOCK_RE"; then
+    die "could not install git: something else on this box still holds the package manager, after apt waited ${HOOK_APT_LOCK_WAIT}s for it (issue #303).
+This is NOT an apt misconfiguration and running apt by hand now will fail the same way. A
+freshly installed Proxmox host runs its own first-boot updates; wait for them to finish:
+  ps -eo pid,etime,cmd | grep -E '[a]pt|[d]pkg|[u]nattended'
+When nothing is left, re-run this hook — nothing has been provisioned (no VM, no user), so a
+re-run is clean. If NOTHING is running and the lock is still held, the package manager is
+wedged rather than busy: 'dpkg --configure -a' (and 'rm /var/lib/dpkg/lock-frontend' only if
+dpkg confirms no owner) then re-run. apt said: $(printf '%s' "$out" | grep -iE "$HOOK_APT_LOCK_RE" | head -1)"
+  fi
+  die "could not install git, so this box cannot fetch the provisioner code (issue #169).
 The pre-repo phase needs exactly one package and this is it. Check apt on this host:
   apt-get update ; apt-get install -y git
 A PVE host with no subscription 401s on the enterprise repo — that alone is harmless, the
-no-subscription repo carries git. Nothing has been provisioned (no VM, no user)."
+no-subscription repo carries git. Nothing has been provisioned (no VM, no user).
+apt said: $(printf '%s' "$out" | tail -3)"
+}
+
+if command -v git >/dev/null 2>&1; then
+  log "git already present ($(git --version 2>/dev/null || echo 'version unknown'))"
+else
+  install_git
 fi
 
 log "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
@@ -513,12 +586,36 @@ else
   export GIT_ASKPASS="$GIT_ASKPASS_HELPER" GIT_TERMINAL_PROMPT=0
 fi
 
+resolve_ref() {   # <repo_dir> <ref> → prints a commit sha, rc 1 if the ref is not there
+  local d="$1" r="$2" c sha
+  for c in "refs/tags/${r}" "refs/remotes/origin/${r}" "$r"; do
+    if sha="$(git -C "$d" rev-parse --verify --quiet "${c}^{commit}" 2>/dev/null)" && [[ -n $sha ]]; then
+      printf '%s' "$sha"; return 0
+    fi
+  done
+  return 1
+}
+
+default_ref() {   # <repo_dir> → prints e.g. origin/main — what "newest" means
+  local d="$1" s
+  s="$(git -C "$d" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)" \
+    || { git -C "$d" remote set-head origin -a >/dev/null 2>&1 || true
+         s="$(git -C "$d" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)" || s=""; }
+  [[ -n $s ]] && { printf '%s' "${s#refs/remotes/}"; return 0; }
+  printf 'origin/main'
+}
+
 install -d -m 0755 "$(dirname "$REPO_DIR")" 2>/dev/null || true
 if [[ -d "${REPO_DIR}/.git" ]]; then
   log "updating the provisioner checkout at ${REPO_DIR}"
-  git -C "$REPO_DIR" pull --ff-only \
-    || die "git pull failed for the existing checkout at ${REPO_DIR} (issue #169).
+  git -C "$REPO_DIR" fetch --prune --tags --force origin \
+    || die "git fetch failed for the existing checkout at ${REPO_DIR} (issue #169/#232).
+Check outbound network/DNS to github.com and that the deploy key at ${DEPLOY_KEY_REMOTE} still grants READ on parrhasia/prometheus. Or remove ${REPO_DIR} and re-run the hook to clone fresh."
+  if [[ -z $PROVISIONER_VERSION ]] && git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+    git -C "$REPO_DIR" pull --ff-only \
+      || die "git pull failed for the existing checkout at ${REPO_DIR} (issue #169).
 A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
+  fi
 else
   log "cloning the provisioner repo into ${REPO_DIR}"
   git clone "$REPO_URL" "$REPO_DIR" \
@@ -529,19 +626,53 @@ Check, in this order:
   • the deploy key staged at ${DEPLOY_KEY_REMOTE} on the helper — is it still valid, and does it grant READ on parrhasia/prometheus?
   • git's own words above
 Nothing has been provisioned (no VM, no user, no sshd change)."
+  [[ -n $PROVISIONER_VERSION ]] && { git -C "$REPO_DIR" fetch --tags --force origin >/dev/null 2>&1 || true; }
 fi
-[[ -r $NEEDLE_MAIN ]] || die "the checkout at ${REPO_DIR} has no ${NEEDLE_MAIN#$REPO_DIR/} — either the clone is incomplete or this commit predates the #169 split. Remove ${REPO_DIR} and re-run the hook."
+
+if [[ -n $PROVISIONER_VERSION ]]; then
+  pinned_sha="$(resolve_ref "$REPO_DIR" "$PROVISIONER_VERSION")" \
+    || die "the provisioner version '${PROVISIONER_VERSION}' (from ${version_where}) does not exist in parrhasia/prometheus (issue #232).
+It was looked for as a tag, as a branch on origin, and as a commit sha — none resolved, after a full fetch.
+NOT falling back to the newest code: a box labelled '${PROVISIONER_VERSION}' that was built from something else is worse than a box that was not built.
+Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provisioned (no VM, no user, no sshd change)."
+  git -C "$REPO_DIR" checkout --detach "$pinned_sha" \
+    || die "could not check out provisioner version '${PROVISIONER_VERSION}' (${pinned_sha}) in ${REPO_DIR} (issue #232).
+git refuses a checkout that would overwrite a locally modified file — that is deliberate, so a debugging edit on this box is never silently discarded. Inspect ${REPO_DIR}, or remove it and re-run the hook to clone fresh."
+  log "checkout pinned at version '${PROVISIONER_VERSION}' → ${pinned_sha} (issue #232)"
+elif [[ -d "${REPO_DIR}/.git" ]] && ! git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+  _newest="$(default_ref "$REPO_DIR")"
+  say "this checkout is detached (a previous lap pinned a version) and nothing is pinned now — moving it back to ${_newest}"
+  git -C "$REPO_DIR" checkout --detach "$_newest" \
+    || die "could not move the detached checkout at ${REPO_DIR} back onto ${_newest} (issue #232).
+A locally modified file stops it. Inspect ${REPO_DIR}, or remove it and re-run the hook to clone fresh."
+  unset _newest
+fi
+
+if [[ -n $PROVISIONER_VERSION && -r $NEEDLE_MAIN ]] \
+   && command -v grep >/dev/null 2>&1 \
+   && ! grep -q 'PROVISIONER_VERSION' "$NEEDLE_MAIN" 2>/dev/null; then
+  say "WARNING: version '${PROVISIONER_VERSION}' PREDATES version pinning (issue #232).
+This host will run it, but the needle at that commit cannot pass the version on, so the CONTROL
+NODE it builds will clone the NEWEST code instead — one estate built from two versions.
+If you need the whole estate on '${PROVISIONER_VERSION}', it is not reachable from here: pick a
+ref that contains the version plumbing, or accept that only this host is pinned."
+fi
+
+[[ -r $NEEDLE_MAIN ]] || die "the checkout at ${REPO_DIR} has no ${NEEDLE_MAIN#$REPO_DIR/} — either the clone is incomplete or this commit predates the #169 split.
+${PROVISIONER_VERSION:+A version is pinned ('${PROVISIONER_VERSION}'), so this is most likely a ref from BEFORE the boot chain was split — pick a newer version, or unpin the estate.
+}Remove ${REPO_DIR} and re-run the hook."
 
 REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || REPO_COMMIT=""
 REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || REPO_COMMIT_SHORT=""
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
-  log "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — issue #169: this is the code this lap executes, not a copy staged on the helper"
+  log "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — version=${PROVISIONER_VERSION:-newest} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
 else
   warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
 fi
 export PROVISIONER_REPO_DIR="$REPO_DIR"
 export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
+export PROVISIONER_VERSION
 
 log "handing off to the checkout's needle: ${NEEDLE_MAIN}"
 _hook_log_file "[hook] ── end of the pre-repo phase; everything below runs from ${REPO_DIR} ──"
