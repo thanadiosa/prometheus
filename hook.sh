@@ -450,6 +450,7 @@ export PROVISIONER_REMOTE_DIR="$_RD"
 . ./helper-lib.sh
 
 
+PREREPO_FINGERPRINTS=""
 _log_prerepo_fingerprints() {
   local f h out=""
   if ! command -v sha256sum >/dev/null 2>&1; then
@@ -461,11 +462,12 @@ _log_prerepo_fingerprints() {
       h="$(sha256sum "./${f}" 2>/dev/null)" && h="${h%% *}" || h=""
       out+=" ${f}=${h:0:12}"
       [[ -n $h ]] || out+="unhashable"
+      [[ -n $h ]] && PREREPO_FINGERPRINTS+="${f} ${h}"$'\n'
     else
       out+=" ${f}=absent"
     fi
   done
-  log "pre-repo script fingerprints (sha256/12, as staged on the helper — issue #169):${out}"
+  log "pre-repo script fingerprints (sha256/12, as staged on the helper — issue #169):${out} — compared against the checkout once it exists (issue #428)"
   return 0
 }
 _log_prerepo_fingerprints
@@ -670,6 +672,35 @@ if [[ -n $REPO_COMMIT ]]; then
 else
   warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
 fi
+
+_compare_staged_to_checkout() {
+  local drift_lib="${REPO_DIR}/bootstrap/staged-drift.sh"
+  local name sha rc summary="" drift=""
+  if [[ -z $PREREPO_FINGERPRINTS ]]; then
+    log "staged-vs-checkout: UNKNOWN-not-compared — no pre-repo fingerprint was recorded on this host, so the staged code was NOT judged (issue #428)"
+    return 0
+  fi
+  if [[ ! -r $drift_lib ]]; then
+    log "staged-vs-checkout: UNKNOWN-not-compared — this checkout has no bootstrap/staged-drift.sh${PROVISIONER_VERSION:+ (version '${PROVISIONER_VERSION}' predates issue #428)}, so the fingerprints above go uncompared, exactly as they did on every lap before it"
+    return 0
+  fi
+  . "$drift_lib" || { warn "could not source ${drift_lib} — the staged code was NOT judged this lap (issue #428)"; return 0; }
+  while read -r name sha; do
+    [[ -n $name ]] || continue
+    staged_verdict "$REPO_DIR" "$name" "$sha"; rc=$?
+    summary+=" ${name}=${STAGED_VERDICT}"
+    [[ $rc -eq 1 ]] && drift+="  • ${name}: the helper is serving ${STAGED_DETAIL}"$'\n'
+  done <<< "$PREREPO_FINGERPRINTS"
+  log "staged-vs-checkout:${summary} (issue #428 — the pre-repo fingerprints above, judged against ${REPO_COMMIT_SHORT:-this checkout})"
+  [[ -n $drift ]] || return 0
+  warn "this cold start ran code STAGED ON THE HELPER that is not what the checkout says it should be (issue #428):
+${drift}The lap CONTINUES — a stale staged script still builds a working estate, and stopping here would be worse than the drift.
+To fix it, re-stage from a current checkout: \`bootstrap/genesis.sh helper\` for this estate, then re-run the hook.${PROVISIONER_VERSION:+
+This checkout is PINNED at version '${PROVISIONER_VERSION}' (issue #232), so the helper may well be serving NEWER code than the pin rather than older — read the line above with that in mind.}"
+  return 0
+}
+_compare_staged_to_checkout
+
 export PROVISIONER_REPO_DIR="$REPO_DIR"
 export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
 export PROVISIONER_VERSION
