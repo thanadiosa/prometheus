@@ -53,6 +53,29 @@ say()  { printf '\n[hook] %s\n' "$*" >&2; _hook_log_file "[hook] $*"; return 0; 
 warn() { printf '\n[hook] WARNING: %s\n' "$*" >&2; _hook_log_file "[hook] WARNING: $*"; return 0; }
 die()  { printf '\n[hook] ERROR: %s\n' "$*" >&2; _hook_log_file "[hook] ERROR: $*"; exit 1; }
 
+HOOK_LAP_STAMP="${PROVISIONER_NEEDLE_LAP_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
+export PROVISIONER_NEEDLE_LAP_STAMP="$HOOK_LAP_STAMP"
+if [[ -z ${HOOK_LOG:-} ]]; then
+  HOOK_FEED="${PROVISIONER_NEEDLE_FEED-}"
+else
+  HOOK_FEED="${PROVISIONER_NEEDLE_FEED-${HOOK_LOG_DIR}/${HOOK_LAP_STAMP}-needle.log}"
+fi
+export PROVISIONER_NEEDLE_FEED="$HOOK_FEED"
+
+_hook_feed_line() {
+  [[ -n ${HOOK_FEED:-} ]] || return 0
+  [[ -d ${HOOK_FEED%/*} ]] || install -d -m 0700 "${HOOK_FEED%/*}" 2>/dev/null || return 0
+  ( umask 077; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$HOOK_FEED" ) 2>/dev/null || return 0
+  chmod 0600 "$HOOK_FEED" 2>/dev/null || true
+  return 0
+}
+
+milestone() {
+  log "$*"
+  _hook_feed_line "[hook] $*"
+  return 0
+}
+
 have_tty=0; { : </dev/tty; } 2>/dev/null && have_tty=1
 
 
@@ -473,7 +496,7 @@ _log_prerepo_fingerprints() {
 _log_prerepo_fingerprints
 
 if helper_detect; then
-  log "helper reachable (auth=$(helper_auth), channel=$(helper_channel))"
+  milestone "seedbox reachable (auth=$(helper_auth), channel=$(helper_channel)) — cold start begins for ${estate}"
 else
   die "cannot reach helper '${helper}' on port ${port} — the deploy key and the seed images both live there, so nothing can proceed.
 Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them (issue #143).
@@ -573,6 +596,7 @@ This box cannot clone the provisioner repo without it. Stage it on the helper (t
 fi
 [[ -s $DEPLOY_KEY ]] || { rm -f "$DEPLOY_KEY"; die "the deploy key fetched from ${DEPLOY_KEY_REMOTE} is EMPTY — re-stage it on the helper and re-run. Nothing has been provisioned."; }
 chmod 0600 "$DEPLOY_KEY"
+milestone "github deploy key pulled from the seedbox — cloning the provisioner repo next"
 
 if head -c 64 "$DEPLOY_KEY" 2>/dev/null | grep -q -- '-----BEGIN'; then
   log "github credential is an SSH key — cloning over SSH"
@@ -669,6 +693,7 @@ REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || 
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
   log "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — version=${PROVISIONER_VERSION:-newest} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
+  _hook_feed_line "[hook] provisioner repo cloned at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (version=${PROVISIONER_VERSION:-newest})"
 else
   warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
 fi
@@ -706,6 +731,7 @@ export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
 export PROVISIONER_VERSION
 
 log "handing off to the checkout's needle: ${NEEDLE_MAIN}"
+_hook_feed_line "[hook] pre-repo phase complete — handing off to the checkout's needle"
 _hook_log_file "[hook] ── end of the pre-repo phase; everything below runs from ${REPO_DIR} ──"
 exec /bin/bash "$NEEDLE_MAIN" "$helper" "$estate"
 
