@@ -78,10 +78,30 @@ milestone() {
 
 have_tty=0; { : </dev/tty; } 2>/dev/null && have_tty=1
 
+HELPER_DEFAULT_SSH_RD="downloads/helper"
+
+parse_helper_target() {
+  local raw="$1" authority
+  HT_HELPER=""; HT_PORT=""; HT_PATH=""
+  if [[ $raw == */* ]]; then
+    authority="${raw%%/*}"
+    HT_PATH="${raw#*/}"          # everything after the first slash
+    HT_PATH="${HT_PATH%/}"       # a trailing slash is noise on a directory path
+  else
+    authority="$raw"
+  fi
+  if [[ $authority =~ ^(.+):([0-9]+)$ ]]; then
+    HT_HELPER="${BASH_REMATCH[1]}"; HT_PORT="${BASH_REMATCH[2]}"
+  else
+    HT_HELPER="$authority"
+  fi
+}
+
 
 helper=""; helper_server=""; port=""; helper_src=""; port_src=""
 helper_env_used=0; helper_cache_used=0; port_env_used=0; port_cache_used=0
 helper_ok=0      # an already-validated address is not re-asked just because the port was bad
+embedded_port=""; embedded_rd=""
 interview_round=0
 INTERVIEW_MAX_ROUNDS="${PROVISIONER_HOOK_INTERVIEW_MAX_ROUNDS:-12}"
 [[ $INTERVIEW_MAX_ROUNDS =~ ^[0-9]+$ ]] && (( INTERVIEW_MAX_ROUNDS >= 1 )) || INTERVIEW_MAX_ROUNDS=12
@@ -113,6 +133,12 @@ Set it in the environment before invoking the hook:
   • PROVISIONER_HELPER_PORT=<port>      (optional, default 22)
 Nothing has been changed on this host."
   fi
+  if [[ $helper_ok != 1 ]]; then
+    parse_helper_target "$helper"
+    helper="$HT_HELPER"; embedded_port="$HT_PORT"; embedded_rd="$HT_PATH"
+    [[ -n $embedded_port || -n $embedded_rd ]] \
+      && log "combined helper form: address='${helper}'${embedded_port:+ port='${embedded_port}'}${embedded_rd:+ remote-dir='${embedded_rd}'}"
+  fi
   if [[ ! $helper =~ ^[A-Za-z0-9._@-]+@[A-Za-z0-9._-]+$ ]]; then
     case "$helper_src" in
       env)   die "PROVISIONER_HELPER='${helper}' is not user@host — fix it and re-run. Nothing has been changed.";;
@@ -124,7 +150,9 @@ Nothing has been changed on this host."
   helper_server="${helper#*@}"; helper_ok=1
 
   port=""; port_src=""
-  if [[ -n ${PROVISIONER_HELPER_PORT:-} && $port_env_used == 0 ]]; then
+  if [[ -n $embedded_port ]]; then
+    port="$embedded_port"; port_src="target"; embedded_port=""
+  elif [[ -n ${PROVISIONER_HELPER_PORT:-} && $port_env_used == 0 ]]; then
     port="${PROVISIONER_HELPER_PORT}"; port_src="env"; port_env_used=1
   elif [[ -f $PORT_CACHE && $port_cache_used == 0 ]]; then
     port="$(cat "$PORT_CACHE")"; port_src="cache"; port_cache_used=1
@@ -202,6 +230,21 @@ else
   log "no controlling terminal and no staged helper password — KEY auth only (stage ${HELPER_PASS_FILE} 0600 if the helper is password-only)"
 fi
 
+
+if [[ -n $embedded_rd ]]; then
+  [[ -n $_RD && $_RD != "$embedded_rd" ]] \
+    && say "helper remote dir: using '${embedded_rd}' from the combined address (overriding PROVISIONER_REMOTE_DIR='${_RD}')"
+  _RD="$embedded_rd"
+  log "helper remote dir set from the combined address: ${_RD}"
+elif [[ -z $_RD && $auth_hint == key ]]; then
+  _RD="$HELPER_DEFAULT_SSH_RD"
+  log "helper remote dir defaulted to '${_RD}' (issue #300: known key/ssh helper, no path given)"
+fi
+SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
+SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
+LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
+DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy"
+VERSION_REMOTE="${_RD:+${_RD}/}version"
 
 [[ $EUID -eq 0 ]] || die "must run as root on the PVE host (the console one-liner runs as root; nothing has been changed)"
 for _bin in pveversion qm pvesm; do
@@ -631,20 +674,36 @@ default_ref() {   # <repo_dir> → prints e.g. origin/main — what "newest" mea
   printf 'origin/main'
 }
 
+run_git_step() {
+  local okline="$1"; shift
+  [[ ${1:-} == -- ]] && shift
+  local out rc
+  out="$("$@" 2>&1)"; rc=$?
+  if (( rc == 0 )); then
+    [[ -n $okline ]] && log "$okline"
+  else
+    [[ -n $out ]] && printf '%s\n' "$out" >&2
+  fi
+  return $rc
+}
+
 install -d -m 0755 "$(dirname "$REPO_DIR")" 2>/dev/null || true
 if [[ -d "${REPO_DIR}/.git" ]]; then
   log "updating the provisioner checkout at ${REPO_DIR}"
-  git -C "$REPO_DIR" fetch --prune --tags --force origin \
+  run_git_step "provisioner checkout fetched (${REPO_DIR})" \
+    -- git -C "$REPO_DIR" fetch --prune --tags --force origin \
     || die "git fetch failed for the existing checkout at ${REPO_DIR} (issue #169/#232).
 Check outbound network/DNS to github.com and that the deploy key at ${DEPLOY_KEY_REMOTE} still grants READ on parrhasia/prometheus. Or remove ${REPO_DIR} and re-run the hook to clone fresh."
   if [[ -z $PROVISIONER_VERSION ]] && git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
-    git -C "$REPO_DIR" pull --ff-only \
+    run_git_step "provisioner checkout fast-forwarded (${REPO_DIR})" \
+      -- git -C "$REPO_DIR" pull --ff-only \
       || die "git pull failed for the existing checkout at ${REPO_DIR} (issue #169).
 A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
   fi
 else
   log "cloning the provisioner repo into ${REPO_DIR}"
-  git clone "$REPO_URL" "$REPO_DIR" \
+  run_git_step "provisioner repo cloned into ${REPO_DIR}" \
+    -- git clone "$REPO_URL" "$REPO_DIR" \
     || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
 Since #169 the boot chain runs the REPO's code, so there is no staged copy to fall back to.
 Check, in this order:
