@@ -600,13 +600,27 @@ install_git() {
   log "installing git (absent on a stock PVE host — issue #169)"
   log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang (issue #303)."
   aptlog="$(mktemp "${TMPDIR:-/tmp}/hook-apt.XXXXXX" 2>/dev/null || printf '%s/hook-apt.%s' "${TMPDIR:-/tmp}" "$$")"
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" update -qq 2>&1 | tee "$aptlog" >&2
-  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"
+  _apt_console() {   # stdin = apt's stream; console gets the ticker only, or all of it if verbose
+    if [[ ${HOOK_VERBOSE:-0} == 1 ]]; then cat
+    else grep --line-buffered -iE "$HOOK_APT_LOCK_RE" || true; fi
+  }
+  _apt_record() {    # full transcript → durable log ONLY, never the console (issue #392)
+    [[ -n ${1:-} ]] || return 0
+    declare -F _hook_log_file >/dev/null 2>&1 || return 0
+    _hook_log_file "apt transcript (issue #392, kept out of the console, held for the record):
+$1"
+    return 0
+  }
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" -o Dpkg::Use-Pty=0 update -qq 2>&1 | tee "$aptlog" | _apt_console >&2
+  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"; _apt_record "$out"
   (( rc == 0 )) \
     || warn "apt-get update exited ${rc} — continuing to the install anyway (a subscription 401 is harmless here). First line back: $(printf '%s' "$out" | head -1)"
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" install -y -qq git 2>&1 | tee "$aptlog" >&2
-  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"; rm -f "$aptlog"
-  (( rc == 0 )) && command -v git >/dev/null 2>&1 && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="$HOOK_APT_LOCK_WAIT" -o Dpkg::Use-Pty=0 install -y -qq git 2>&1 | tee "$aptlog" | _apt_console >&2
+  rc=${PIPESTATUS[0]}; out="$(cat "$aptlog" 2>/dev/null)"; _apt_record "$out"; rm -f "$aptlog"
+  if (( rc == 0 )) && command -v git >/dev/null 2>&1; then
+    log "git installed ($(git --version 2>/dev/null || echo 'version unknown'))"
+    return 0
+  fi
   if printf '%s' "$out" | grep -qiE "$HOOK_APT_LOCK_RE"; then
     die "could not install git: something else on this box still holds the package manager, after apt waited ${HOOK_APT_LOCK_WAIT}s for it (issue #303).
 This is NOT an apt misconfiguration and running apt by hand now will fail the same way. A
@@ -703,7 +717,7 @@ A local modification or a diverged branch stops a fast-forward. Inspect it, or r
 else
   log "cloning the provisioner repo into ${REPO_DIR}"
   run_git_step "provisioner repo cloned into ${REPO_DIR}" \
-    -- git clone "$REPO_URL" "$REPO_DIR" \
+    -- git clone --quiet "$REPO_URL" "$REPO_DIR" \
     || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
 Since #169 the boot chain runs the REPO's code, so there is no staged copy to fall back to.
 Check, in this order:
@@ -751,7 +765,7 @@ REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || REPO_COMMIT=""
 REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || REPO_COMMIT_SHORT=""
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
-  log "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — version=${PROVISIONER_VERSION:-newest} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
+  say "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — version=${PROVISIONER_VERSION:-newest} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
   _hook_feed_line "[hook] provisioner repo cloned at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (version=${PROVISIONER_VERSION:-newest})"
 else
   warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
