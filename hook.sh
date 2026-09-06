@@ -172,7 +172,7 @@ Nothing has been changed on this host."
     continue     # the bad source is marked used — the next round reaches the prompt
   fi
 
-  [[ $helper_src != prompt ]] && say "using helper ${helper} on port ${port} (from ${helper_src})"
+  [[ $helper_src != prompt ]] && log "using helper ${helper} on port ${port} (from ${helper_src})"
 
   if ! timeout 5 bash -c "exec 3<>/dev/tcp/${helper_server}/${port}" 2>/dev/null; then
     [[ $helper_src == env ]] && die "helper '${helper}' is unreachable on :${port} (TCP connect failed) and it came from PROVISIONER_HELPER — check the address/port/DNS and re-run. Nothing has been changed."
@@ -252,7 +252,7 @@ for _bin in pveversion qm pvesm; do
     || die "'${_bin}' not found — this does not look like a Proxmox VE host. The bootstrap chain provisions a PVE hypervisor and nothing here will work on anything else. Nothing has been changed."
 done
 unset _bin
-say "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
+log "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
 
 cm_opts=()
 [[ -n ${PROVISIONER_HELPER_CIPHERS-aes128-ctr} ]] && cm_opts+=(-o Ciphers="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}")
@@ -584,42 +584,10 @@ Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provis
 fi
 
 if [[ -n $PROVISIONER_VERSION ]]; then
-  say "building provisioner version '${PROVISIONER_VERSION}' (from ${version_src})"
+  log "building provisioner version '${PROVISIONER_VERSION}' (from ${version_src})"
 else
   log "no version pinned (${VERSION_REMOTE} absent or empty, and no PROVISIONER_VERSION) — building the newest code, as every lap before issue #232 did"
 fi
-
-_admin_pass_hit=0
-if [[ -z ${PROVISIONER_PVE_ADMIN_PASS:-} ]]; then
-  _ap_tmp="$(mktemp)" || _ap_tmp=""          # mktemp creates it 0600
-  if [[ -n $_ap_tmp ]]; then
-    chmod 600 "$_ap_tmp" 2>/dev/null
-    if helper_get "${SECRETS_REMOTE}/pve-admin-pass" "$_ap_tmp" 2>/dev/null && [[ -s $_ap_tmp ]]; then
-      chmod 600 "$_ap_tmp" 2>/dev/null       # the transfer may have reset the mode to the remote's
-      PROVISIONER_PVE_ADMIN_PASS="$(cat "$_ap_tmp")"
-      export PROVISIONER_PVE_ADMIN_PASS
-      _admin_pass_hit=1
-    fi
-    rm -f "$_ap_tmp"                          # gone at once; the value now lives only in the env var
-  fi
-  unset _ap_tmp
-fi
-if [[ $_admin_pass_hit -eq 1 && -z ${PROVISIONER_PVE_ADMIN_USER:-} ]]; then
-  _au_tmp="$(mktemp)" || _au_tmp=""
-  if [[ -n $_au_tmp ]] && helper_get "${SECRETS_REMOTE}/pve-admin-user" "$_au_tmp" 2>/dev/null && [[ -s $_au_tmp ]]; then
-    PROVISIONER_PVE_ADMIN_USER="$(head -n 1 "$_au_tmp" | tr -d '[:space:]')"
-    [[ -n $PROVISIONER_PVE_ADMIN_USER ]] && export PROVISIONER_PVE_ADMIN_USER
-  fi
-  [[ -n $_au_tmp ]] && rm -f "$_au_tmp"
-  unset _au_tmp
-  [[ -z ${PROVISIONER_PVE_ADMIN_USER:-} ]] && export PROVISIONER_PVE_ADMIN_USER=provisioner
-fi
-if [[ $_admin_pass_hit -eq 1 ]]; then
-  say "using the PVE admin account the estate recorded on the helper (user '${PROVISIONER_PVE_ADMIN_USER:-provisioner}') — not asking for it again this build (issue #391)"
-else
-  log "no admin account staged on the helper (${SECRETS_REMOTE}/pve-admin-pass absent) — the needle will ask for it, as it does on a first-ever build (issue #391)"
-fi
-unset _admin_pass_hit
 
 HOOK_APT_LOCK_WAIT="${PROVISIONER_APT_LOCK_WAIT:-300}"
 
@@ -629,7 +597,7 @@ install_git() {
   local out rc aptlog
   [[ $HOOK_APT_LOCK_WAIT =~ ^[1-9][0-9]*$ ]] \
     || die "PROVISIONER_APT_LOCK_WAIT must be a whole number of seconds, 1 or more (got '${HOOK_APT_LOCK_WAIT}'). It bounds how long apt may wait for the package-manager lock. apt reads a negative value as 'wait forever' — the hang issue #303 exists to prevent — and 0 is apt-get's fail-immediately default, which is the #303 bug itself."
-  say "installing git (absent on a stock PVE host — issue #169)"
+  log "installing git (absent on a stock PVE host — issue #169)"
   log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang (issue #303)."
   aptlog="$(mktemp "${TMPDIR:-/tmp}/hook-apt.XXXXXX" 2>/dev/null || printf '%s/hook-apt.%s' "${TMPDIR:-/tmp}" "$$")"
   _apt_console() {   # stdin = apt's stream; console gets the ticker only, or all of it if verbose
@@ -677,7 +645,7 @@ else
   install_git
 fi
 
-say "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
+log "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
 if ! helper_get "$DEPLOY_KEY_REMOTE" "$DEPLOY_KEY"; then
   rm -f "$DEPLOY_KEY"
   die "could not pull the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE}) — see the [helper-lib] line above for the transport's own words.
@@ -735,7 +703,7 @@ run_git_step() {
 
 install -d -m 0755 "$(dirname "$REPO_DIR")" 2>/dev/null || true
 if [[ -d "${REPO_DIR}/.git" ]]; then
-  say "updating the provisioner checkout at ${REPO_DIR}"
+  log "updating the provisioner checkout at ${REPO_DIR}"
   run_git_step "provisioner checkout fetched (${REPO_DIR})" \
     -- git -C "$REPO_DIR" fetch --prune --tags --force origin \
     || die "git fetch failed for the existing checkout at ${REPO_DIR} (issue #169/#232).
@@ -747,7 +715,7 @@ Check outbound network/DNS to github.com and that the deploy key at ${DEPLOY_KEY
 A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
   fi
 else
-  say "cloning the provisioner repo into ${REPO_DIR}"
+  log "cloning the provisioner repo into ${REPO_DIR}"
   run_git_step "provisioner repo cloned into ${REPO_DIR}" \
     -- git clone --quiet "$REPO_URL" "$REPO_DIR" \
     || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
@@ -797,7 +765,7 @@ REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || REPO_COMMIT=""
 REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || REPO_COMMIT_SHORT=""
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
-  say "running the provisioner repo at ${REPO_COMMIT_SHORT:-$REPO_COMMIT} (version=${PROVISIONER_VERSION:-newest})"
+  log "running the provisioner repo at ${REPO_COMMIT_SHORT:-$REPO_COMMIT} (version=${PROVISIONER_VERSION:-newest})"
   log "…that checkout is ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} in ${REPO_DIR} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
   _hook_feed_line "[hook] provisioner repo cloned at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (version=${PROVISIONER_VERSION:-newest})"
 else
