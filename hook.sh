@@ -797,7 +797,8 @@ REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || REPO_COMMIT=""
 REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || REPO_COMMIT_SHORT=""
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
-  say "running the provisioner repo at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (${REPO_DIR}) — version=${PROVISIONER_VERSION:-newest} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
+  say "running the provisioner repo at ${REPO_COMMIT_SHORT:-$REPO_COMMIT} (version=${PROVISIONER_VERSION:-newest})"
+  log "…that checkout is ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} in ${REPO_DIR} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
   _hook_feed_line "[hook] provisioner repo cloned at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (version=${PROVISIONER_VERSION:-newest})"
 else
   warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
