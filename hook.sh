@@ -252,7 +252,7 @@ for _bin in pveversion qm pvesm; do
     || die "'${_bin}' not found — this does not look like a Proxmox VE host. The bootstrap chain provisions a PVE hypervisor and nothing here will work on anything else. Nothing has been changed."
 done
 unset _bin
-log "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
+say "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
 
 cm_opts=()
 [[ -n ${PROVISIONER_HELPER_CIPHERS-aes128-ctr} ]] && cm_opts+=(-o Ciphers="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}")
@@ -597,7 +597,7 @@ install_git() {
   local out rc aptlog
   [[ $HOOK_APT_LOCK_WAIT =~ ^[1-9][0-9]*$ ]] \
     || die "PROVISIONER_APT_LOCK_WAIT must be a whole number of seconds, 1 or more (got '${HOOK_APT_LOCK_WAIT}'). It bounds how long apt may wait for the package-manager lock. apt reads a negative value as 'wait forever' — the hang issue #303 exists to prevent — and 0 is apt-get's fail-immediately default, which is the #303 bug itself."
-  log "installing git (absent on a stock PVE host — issue #169)"
+  say "installing git (absent on a stock PVE host — issue #169)"
   log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang (issue #303)."
   aptlog="$(mktemp "${TMPDIR:-/tmp}/hook-apt.XXXXXX" 2>/dev/null || printf '%s/hook-apt.%s' "${TMPDIR:-/tmp}" "$$")"
   _apt_console() {   # stdin = apt's stream; console gets the ticker only, or all of it if verbose
@@ -645,7 +645,7 @@ else
   install_git
 fi
 
-log "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
+say "pulling the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE})"
 if ! helper_get "$DEPLOY_KEY_REMOTE" "$DEPLOY_KEY"; then
   rm -f "$DEPLOY_KEY"
   die "could not pull the GitHub deploy key from the helper (${DEPLOY_KEY_REMOTE}) — see the [helper-lib] line above for the transport's own words.
@@ -703,7 +703,7 @@ run_git_step() {
 
 install -d -m 0755 "$(dirname "$REPO_DIR")" 2>/dev/null || true
 if [[ -d "${REPO_DIR}/.git" ]]; then
-  log "updating the provisioner checkout at ${REPO_DIR}"
+  say "updating the provisioner checkout at ${REPO_DIR}"
   run_git_step "provisioner checkout fetched (${REPO_DIR})" \
     -- git -C "$REPO_DIR" fetch --prune --tags --force origin \
     || die "git fetch failed for the existing checkout at ${REPO_DIR} (issue #169/#232).
@@ -715,7 +715,7 @@ Check outbound network/DNS to github.com and that the deploy key at ${DEPLOY_KEY
 A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
   fi
 else
-  log "cloning the provisioner repo into ${REPO_DIR}"
+  say "cloning the provisioner repo into ${REPO_DIR}"
   run_git_step "provisioner repo cloned into ${REPO_DIR}" \
     -- git clone --quiet "$REPO_URL" "$REPO_DIR" \
     || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
