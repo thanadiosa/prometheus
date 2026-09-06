@@ -589,6 +589,38 @@ else
   log "no version pinned (${VERSION_REMOTE} absent or empty, and no PROVISIONER_VERSION) — building the newest code, as every lap before issue #232 did"
 fi
 
+_admin_pass_hit=0
+if [[ -z ${PROVISIONER_PVE_ADMIN_PASS:-} ]]; then
+  _ap_tmp="$(mktemp)" || _ap_tmp=""          # mktemp creates it 0600
+  if [[ -n $_ap_tmp ]]; then
+    chmod 600 "$_ap_tmp" 2>/dev/null
+    if helper_get "${SECRETS_REMOTE}/pve-admin-pass" "$_ap_tmp" 2>/dev/null && [[ -s $_ap_tmp ]]; then
+      chmod 600 "$_ap_tmp" 2>/dev/null       # the transfer may have reset the mode to the remote's
+      PROVISIONER_PVE_ADMIN_PASS="$(cat "$_ap_tmp")"
+      export PROVISIONER_PVE_ADMIN_PASS
+      _admin_pass_hit=1
+    fi
+    rm -f "$_ap_tmp"                          # gone at once; the value now lives only in the env var
+  fi
+  unset _ap_tmp
+fi
+if [[ $_admin_pass_hit -eq 1 && -z ${PROVISIONER_PVE_ADMIN_USER:-} ]]; then
+  _au_tmp="$(mktemp)" || _au_tmp=""
+  if [[ -n $_au_tmp ]] && helper_get "${SECRETS_REMOTE}/pve-admin-user" "$_au_tmp" 2>/dev/null && [[ -s $_au_tmp ]]; then
+    PROVISIONER_PVE_ADMIN_USER="$(head -n 1 "$_au_tmp" | tr -d '[:space:]')"
+    [[ -n $PROVISIONER_PVE_ADMIN_USER ]] && export PROVISIONER_PVE_ADMIN_USER
+  fi
+  [[ -n $_au_tmp ]] && rm -f "$_au_tmp"
+  unset _au_tmp
+  [[ -z ${PROVISIONER_PVE_ADMIN_USER:-} ]] && export PROVISIONER_PVE_ADMIN_USER=provisioner
+fi
+if [[ $_admin_pass_hit -eq 1 ]]; then
+  say "using the PVE admin account the estate recorded on the helper (user '${PROVISIONER_PVE_ADMIN_USER:-provisioner}') — not asking for it again this build (issue #391)"
+else
+  log "no admin account staged on the helper (${SECRETS_REMOTE}/pve-admin-pass absent) — the needle will ask for it, as it does on a first-ever build (issue #391)"
+fi
+unset _admin_pass_hit
+
 HOOK_APT_LOCK_WAIT="${PROVISIONER_APT_LOCK_WAIT:-300}"
 
 HOOK_APT_LOCK_RE='could not get lock|unable to acquire the dpkg frontend lock|dpkg frontend lock|is another process using it|waiting for cache lock|unable to lock the administration directory'
