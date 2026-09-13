@@ -774,7 +774,12 @@ fi
 
 _compare_staged_to_checkout() {
   local drift_lib="${REPO_DIR}/bootstrap/staged-drift.sh"
-  local name sha rc summary="" drift=""
+  local name sha rc summary="" drift="" drift_detail="" short="" answer="" scope=""
+  local n_checked=0 n_drift=0 n_local=0 n_differs=0
+  local can_restage=1 restage_why="" restage_why_long="" forced="" pass_note="" read_rc=0
+  local ask_timeout
+  local genesis_main="${REPO_DIR}/bootstrap/genesis.sh"
+  local hook_main="${REPO_DIR}/bootstrap/hook.sh"
   if [[ -z $PREREPO_FINGERPRINTS ]]; then
     log "staged-vs-checkout: UNKNOWN-not-compared — no pre-repo fingerprint was recorded on this host, so the staged code was NOT judged (issue #428)"
     return 0
@@ -786,16 +791,154 @@ _compare_staged_to_checkout() {
   . "$drift_lib" || { warn "could not source ${drift_lib} — the staged code was NOT judged this lap (issue #428)"; return 0; }
   while read -r name sha; do
     [[ -n $name ]] || continue
+    n_checked=$((n_checked + 1))
     staged_verdict "$REPO_DIR" "$name" "$sha"; rc=$?
     summary+=" ${name}=${STAGED_VERDICT}"
-    [[ $rc -eq 1 ]] && drift+="  • ${name}: the helper is serving ${STAGED_DETAIL}"$'\n'
+    if [[ $rc -eq 1 ]]; then
+      n_drift=$((n_drift + 1))
+      case "$STAGED_VERDICT" in
+        STALE-behind-checkout-by-*) short="${STAGED_VERDICT##*-by-} change(s) behind" ;;
+        DIFFERS-from-checkout)
+          if [[ $STAGED_DETAIL == *"modified locally"* ]]; then
+            n_local=$((n_local + 1))
+            short="this CHECKOUT is the modified side — the helper has the last committed version"
+          else
+            n_differs=$((n_differs + 1))
+            short="not this checkout's version — hand-edited on the helper, or NEWER than this checkout"
+          fi ;;
+        *) short="$STAGED_VERDICT" ;;
+      esac
+      drift+="  • ${name} — ${short}"$'\n'
+      drift_detail+="  • ${name}: the helper is serving ${STAGED_DETAIL}"$'\n'
+    fi
   done <<< "$PREREPO_FINGERPRINTS"
   log "staged-vs-checkout:${summary} (issue #428 — the pre-repo fingerprints above, judged against ${REPO_COMMIT_SHORT:-this checkout})"
   [[ -n $drift ]] || return 0
-  warn "this cold start ran code STAGED ON THE HELPER that is not what the checkout says it should be (issue #428):
-${drift}The lap CONTINUES — a stale staged script still builds a working estate, and stopping here would be worse than the drift.
-To fix it, re-stage from a current checkout: \`bootstrap/genesis.sh helper\` for this estate, then re-run the hook.${PROVISIONER_VERSION:+
-This checkout is PINNED at version '${PROVISIONER_VERSION}' (issue #232), so the helper may well be serving NEWER code than the pin rather than older — read the line above with that in mind.}"
+  log "staged-vs-checkout DRIFT (issue #428):
+${drift_detail%$'\n'}"
+
+  if (( n_local == n_drift )); then
+    if (( n_checked == 1 )); then
+      scope="this boot fetched 1 script from the helper and it does not match this checkout — because this CHECKOUT is locally modified, not because the helper is behind:"
+    else
+      scope="this boot fetched ${n_checked} scripts from the helper and ${n_drift} of them do not match this checkout — because this CHECKOUT is locally modified, not because the helper is behind:"
+    fi
+  elif (( n_local > 0 )); then
+    scope="this boot fetched ${n_checked} scripts from the helper; ${n_drift} of them do not match this checkout — read each line for which side is the modified one:"
+  elif (( n_differs == n_drift )); then
+    if (( n_checked == 1 )); then
+      scope="this boot fetched 1 script from the helper and it does not match this checkout:"
+    else
+      scope="this boot fetched ${n_checked} scripts from the helper; ${n_drift} of them do not match this checkout:"
+    fi
+  elif (( n_checked == 1 )); then
+    scope="this boot fetched 1 script from the helper and it is not up to date:"
+  elif (( n_drift == n_checked )); then
+    scope="this boot fetched ${n_checked} scripts from the helper and none of them are up to date:"
+  elif (( n_drift == 1 )); then
+    scope="this boot fetched ${n_checked} scripts from the helper; 1 of them is not up to date:"
+  else
+    scope="this boot fetched ${n_checked} scripts from the helper; ${n_drift} of them are not up to date:"
+  fi
+
+  if [[ -n ${PROVISIONER_HOOK_RESTAGED:-} ]]; then
+    can_restage=0
+    restage_why="a re-stage from this checkout already ran earlier in this boot (from ${PROVISIONER_HOOK_RESTAGED}) and the drift is STILL here — not offering it again"
+    restage_why_long="${restage_why}. Something other than staleness is in play: check that ${genesis_main} actually reached this estate's helper, and that PROVISIONER_REMOTE_DIR ('${PROVISIONER_REMOTE_DIR-<unset>}') names the directory this boot fetched from (issue #313 — a re-stage into the wrong account reports success)."
+  elif (( n_local > 0 )); then
+    can_restage=0
+    restage_why="not re-staging: the difference is this checkout's own local modification, and a re-stage would push it onto the helper"
+    restage_why_long="${restage_why}. Commit or discard the local change and re-run the hook; the helper is serving the last committed version and needs nothing done to it."
+  elif [[ -n ${PROVISIONER_VERSION:-} ]]; then
+    can_restage=0
+    restage_why="not re-staging: this checkout is PINNED at version '${PROVISIONER_VERSION}', so a re-stage would rewind the helper to the pin"
+    restage_why_long="${restage_why} for every later lap of this estate (issue #232). If the pin really is what the helper should serve, run \`bootstrap/genesis.sh helper\` from it deliberately."
+  elif [[ -z ${PROVISIONER_REMOTE_DIR+x} ]]; then
+    can_restage=0
+    restage_why="not re-staging: PROVISIONER_REMOTE_DIR is unset here, and genesis.sh never guesses a helper's layout"
+    restage_why_long="${restage_why} (issue #313) — a re-stage from this environment would either die or stage this estate's boot scripts into the wrong account."
+  elif [[ ! -r $genesis_main || ! -r $hook_main ]]; then
+    can_restage=0
+    restage_why="not re-staging: this checkout has no readable bootstrap/genesis.sh + bootstrap/hook.sh to re-stage and restart with"
+    restage_why_long="${restage_why} (looked for ${genesis_main} and ${hook_main}) — an old pinned ref is the usual reason."
+  fi
+
+  printf '%s\n' "$scope" >&2
+  printf '%s' "$drift" >&2
+  if (( n_local == 0 )) && [[ -z ${PROVISIONER_VERSION:-} ]]; then
+    printf '%s\n' "  fix with: bootstrap/genesis.sh helper" >&2
+  fi
+  if [[ -n ${PROVISIONER_VERSION:-} ]] && (( n_differs > 0 )); then
+    printf '%s\n' "  (pinned to version '${PROVISIONER_VERSION}' — the helper may be NEWER than the pin, not older)" >&2
+  fi
+  if [[ -n $restage_why ]]; then
+    printf '%s\n' "  ${restage_why}" >&2
+    log "staged-vs-checkout: ${restage_why_long}"
+  fi
+
+  ask_timeout="${PROVISIONER_HOOK_DRIFT_TIMEOUT:-60}"
+  [[ $ask_timeout =~ ^[0-9]+$ ]] && (( ask_timeout >= 1 )) || ask_timeout=60
+
+  forced="${PROVISIONER_STAGED_DRIFT:-}"
+  case "${forced,,}" in
+    ""|continue|restage|stop) forced="${forced,,}" ;;
+    *) warn "PROVISIONER_STAGED_DRIFT='${forced}' is not one of continue|restage|stop — ignoring it"; forced="" ;;
+  esac
+
+  if [[ -n $forced ]]; then
+    answer="$forced"
+    log "staged-vs-checkout: answering '${answer}' from PROVISIONER_STAGED_DRIFT (no question asked)"
+  elif [[ ${have_tty:-0} == 1 ]]; then
+    if (( can_restage == 1 )); then
+      printf '%s\n' "  [R] re-stage the helper from this checkout and start over   (default)" >&2
+      printf '%s\n' "  [c] continue with what already ran" >&2
+      printf '%s\n' "  [n] stop" >&2
+      read -r -t "$ask_timeout" -p "choice [R/c/n]: " answer </dev/tty; read_rc=$?
+    else
+      printf '%s\n' "  [C] continue with what already ran   (default)" >&2
+      printf '%s\n' "  [n] stop" >&2
+      read -r -t "$ask_timeout" -p "continue anyway? [Y/n]: " answer </dev/tty; read_rc=$?
+    fi
+    if (( read_rc > 128 )); then
+      printf '\n%s\n' "continuing (no answer in ${ask_timeout}s)" >&2
+      log "staged-vs-checkout: no answer in ${ask_timeout}s — continuing (issue #58: this question must never be able to wedge a walk-away lap)"
+      return 0
+    elif (( read_rc != 0 )); then
+      printf '\n%s\n' "continuing (the console went away while asking)" >&2
+      log "staged-vs-checkout: lost the controlling terminal while asking — continuing"
+      return 0
+    fi
+  else
+    log "staged-vs-checkout: no controlling terminal and no PROVISIONER_STAGED_DRIFT — continuing without asking, exactly as every lap before this question existed"
+    return 0
+  fi
+
+  case "${answer,,}" in
+    n|no|stop)
+      pass_note=""
+      [[ -s ${HELPER_PASS_FILE:-} ]] && pass_note=", the helper password at ${HELPER_PASS_FILE}"
+      die "stopped at your request — the staged code does not match this checkout.
+Re-stage from a current checkout: \`bootstrap/genesis.sh helper\` for this estate, then re-run the hook.
+Nothing has been PROVISIONED (no VM, no user, no sshd change), but this host is no longer bare: git is installed, the GitHub read-only deploy key is at ${DEPLOY_KEY}${pass_note}, and the provisioner checkout is at ${REPO_DIR}."
+      ;;
+    r|re|restage|"")
+      if (( can_restage != 1 )); then
+        [[ -n $forced && -n $restage_why ]] && printf '%s\n' "  ${restage_why} — continuing" >&2
+        return 0
+      fi
+      say "re-staging the helper from this checkout (${REPO_COMMIT_SHORT:-this checkout}) — a handful of helper logins, then the hook starts over"
+      if GENESIS_HELPER="$helper" GENESIS_ESTATE="$estate" /bin/bash "$genesis_main" helper; then
+        export PROVISIONER_HOOK_RESTAGED="${REPO_COMMIT_SHORT:-unknown}"
+        say "re-staged — restarting the hook so this lap's PRE-repo phase runs the current code too"
+        log "restarting the hook: exec /bin/bash ${hook_main} (PROVISIONER_HOOK_RESTAGED=${PROVISIONER_HOOK_RESTAGED} rides across the exec, so the second pass can never offer this again)"
+        exec /bin/bash "$hook_main"
+        warn "could not exec ${hook_main} to restart the hook — continuing this lap instead; everything from here on already comes from the checkout"
+        return 0
+      fi
+      warn "the re-stage FAILED (${genesis_main} helper) — NOT restarting, because the helper still serves the same bytes and a restart would land back here. genesis said why, above. Continuing this lap on the code that already ran."
+      return 0
+      ;;
+  esac
   return 0
 }
 _compare_staged_to_checkout
