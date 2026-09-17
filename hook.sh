@@ -3,6 +3,8 @@ set -uo pipefail
 reset
 
 _RD="${PROVISIONER_REMOTE_DIR:-}"
+_RD_FROM_ENV=0
+[[ -n ${PROVISIONER_REMOTE_DIR+x} ]] && _RD_FROM_ENV=1
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
 SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib — the ONLY staged file we fetch
@@ -231,20 +233,64 @@ else
 fi
 
 
+RD_FACT_FILE="${STATE_DIR}/remote-dir"   # staged by needle.sh for this host (issue #734)
+RD_FACT=""            # its value — "" is a REAL value (the chroot root), never a null
+RD_FACT_HAVE=0        # 1 = the file is there AND readable, whatever it says
+RD_FACT_UNREADABLE=0  # 1 = the file is there and we could not read it (0700 dir, odd mode)
+if [[ -e $RD_FACT_FILE ]]; then
+  if [[ -r $RD_FACT_FILE ]] && RD_FACT="$(tr -d '[:space:]' < "$RD_FACT_FILE" 2>/dev/null)"; then
+    RD_FACT_HAVE=1
+    while [[ $RD_FACT == */ ]]; do RD_FACT="${RD_FACT%/}"; done
+  else
+    RD_FACT_UNREADABLE=1
+  fi
+fi
+
+RD_SRC=""
 if [[ -n $embedded_rd ]]; then
   [[ -n $_RD && $_RD != "$embedded_rd" ]] \
     && say "helper remote dir: using '${embedded_rd}' from the combined address (overriding PROVISIONER_REMOTE_DIR='${_RD}')"
   _RD="$embedded_rd"
+  RD_SRC="the path typed with the helper address"
   log "helper remote dir set from the combined address: ${_RD}"
-elif [[ -z $_RD && $auth_hint == key ]]; then
+elif [[ -n $_RD || $_RD_FROM_ENV == 1 ]]; then
+  RD_SRC="PROVISIONER_REMOTE_DIR in the environment"
+  log "helper remote dir '${_RD}' taken from PROVISIONER_REMOTE_DIR (an explicit value outranks this box's staged fact — issue #834)"
+elif (( RD_FACT_HAVE )); then
+  _RD="$RD_FACT"
+  RD_SRC="${RD_FACT_FILE}, this box's own staged fact"
+  log "helper remote dir '${_RD}' read from ${RD_FACT_FILE} — the layout a previous lap staged on this host, which beats guessing the well-known base (issue #834)"
+elif [[ $auth_hint == key ]]; then
   _RD="$HELPER_DEFAULT_SSH_RD"
-  log "helper remote dir defaulted to '${_RD}' (issue #300: known key/ssh helper, no path given)"
+  RD_SRC="the well-known ssh base — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
+  log "helper remote dir defaulted to '${_RD}' (issue #300: known key/ssh helper, no path given, no staged fact)"
+else
+  RD_SRC="the helper's login/chroot root — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
 fi
+(( RD_FACT_UNREADABLE )) \
+  && say "this box carries ${RD_FACT_FILE} but it could not be read — the layout it names was NOT used (issue #834). Check it with: ls -l ${RD_FACT_FILE}"
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
 SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
 DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy"
 VERSION_REMOTE="${_RD:+${_RD}/}version"
+
+foreign_estate_dir() {
+  local est="${1:-}" rd="${2:-}" last parent
+  [[ -n $est && -n $rd ]] || return 1
+  while [[ $rd == */ ]]; do rd="${rd%/}"; done
+  [[ $rd == */* ]] || return 1                 # no parent ⇒ nothing identifies it as a slot
+  last="${rd##*/}"; parent="${rd%/*}"
+  [[ ${parent##*/} == helper ]] || return 1    # not the estates parent ⇒ custom layout ⇒ NOT JUDGED
+  [[ -n $last && $last != "$est" ]] || return 1
+  printf '%s' "$last"
+}
+if wrong_estate_dir="$(foreign_estate_dir "$estate" "$_RD")"; then
+  die "this box says it is ${estate} but the seedbox directory it was pointed at is ${wrong_estate_dir}'s — the hook was started for the wrong estate; re-run it for ${estate}.
+The directory is '${_RD}', chosen from ${RD_SRC}.
+Nothing has been fetched and nothing has been changed on this box: both facts above are known before the first byte leaves the helper.
+If this box is really meant to build ${wrong_estate_dir}, the estate name is the PVE hostname (SPEC §14.6) — install it under that name, or re-run with PROVISIONER_ESTATE=${wrong_estate_dir} for a standalone run."
+fi
 
 [[ $EUID -eq 0 ]] || die "must run as root on the PVE host (the console one-liner runs as root; nothing has been changed)"
 for _bin in pveversion qm pvesm; do
@@ -449,7 +495,27 @@ block is usually time-limited; wait it out and re-run. Your helper password has 
     auth)
       fetch_fail_reason="the helper REJECTED the password (authentication failed)" ; return 2;;
     missing)
-      fetch_fail_reason="authenticated fine, but ${LIB_REMOTE} could not be read from the helper — re-run genesis.sh's deploy to stage the boot scripts. Your helper password has been KEPT." ; return 3;;
+      local _rd_hint=""
+      if (( RD_FACT_HAVE )) && [[ $RD_FACT != "$_RD" ]]; then
+        _rd_hint="
+  this box says : '${RD_FACT}'  (${RD_FACT_FILE} — staged by the lap that set this estate up)
+THE TWO DISAGREE, and the box's own fact is the better bet. Re-run the one-liner with
+  PROVISIONER_REMOTE_DIR='${RD_FACT}'
+and do NOT re-stage anything until that has been tried."
+      elif (( RD_FACT_UNREADABLE )); then
+        _rd_hint="
+  NOTE: this box carries ${RD_FACT_FILE} — which names the layout — and it could not be READ
+  (check it with: ls -l ${RD_FACT_FILE}). Settle that before concluding the scripts are gone."
+      fi
+      fetch_fail_reason="authenticated fine, but the boot scripts could not be read from the helper. The LOGIN worked, so this is about WHERE this run looked, not who it logged in as.
+  looked in     : '${_RD:-<the helper login/chroot root>}' — i.e. ${LIB_REMOTE}
+  that came from: ${RD_SRC:-a remote dir resolved before this run}${_rd_hint}
+Your helper password has been KEPT — it was never the problem.
+BEFORE RE-STAGING ANYTHING, CHECK WHICH DIRECTORY IS ACTUALLY EMPTY. A deploy aimed at a wrongly
+resolved remote dir writes this estate's boot scripts into the SHARED PARENT account, where it
+reports success and every other estate can then read them (issue #313). Re-run genesis.sh's
+deploy ONLY once the directory named above is confirmed to be this estate's own and confirmed
+empty." ; return 3;;
     transport)
       fetch_fail_reason="transport error reaching the helper: $(printf '%s' "$out" | tr '\n' ';')" ; return 1;;
     *)
