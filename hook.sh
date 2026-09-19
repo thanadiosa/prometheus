@@ -439,6 +439,7 @@ hook_note_verified_id() {   # <scp -v transcript>
 
 fetch_fail_reason=""    # human-readable "why" for the last fetch_lib failure
 banner_closes=0         # how many times the helper hung up on us (see the 'banned' class)
+hook_probe_knock=0      # 1 once the #877 probe has spent a failed login (see below)
 fetch_lib() {
   fetch_fail_reason=""
   local out rc key_fail=""
@@ -527,7 +528,48 @@ empty." ; return 3;;
 
 hook_find_askpass_dir >/dev/null || true
 
-attempts=0
+_pw_probe_offered_password() {   # <transcript> → 1 ONLY when a method list proves otherwise
+  local o list
+  o="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$o" in *"permission denied ("*) ;; *) return 0;; esac   # no list ⇒ cannot tell ⇒ refusal
+  list="${o##*permission denied (}"; list="${list%%)*}"
+  case ",${list//[[:space:]]/}," in *,password,*) return 0;; esac
+  return 1
+}
+
+pw_probe_out=""; pw_probe_rc=0; pw_probe_class=""; pw_probe_fate=""; pw_probe_why=""
+if [[ -s $HELPER_PASS_FILE ]]; then
+  pw_probe_out="$(printf 'exit\n' | hook_sftp_pass)"; pw_probe_rc=$?
+  pw_probe_class="$(classify_ssh_failure "$pw_probe_out" "$pw_probe_rc")"
+  if [[ $pw_probe_class == auth ]] && ! _pw_probe_offered_password "$pw_probe_out"; then
+    pw_probe_why="the helper turned the LOGIN down without offering a password method at all, so this password was never actually tried"
+  elif [[ $pw_probe_class != auth ]]; then
+    pw_probe_why="$pw_probe_class"
+  fi
+  if [[ $pw_probe_rc -eq 0 ]]; then
+    log "the helper accepted the password"
+  elif [[ -z $pw_probe_why ]]; then
+    if [[ $hook_collected_pass == 1 ]]; then
+      rm -f "$HELPER_PASS_FILE"; hook_collected_pass=0
+      pw_probe_fate="The password you just typed has been DISCARDED — it was this run's own to discard. Re-run the one-liner and enter the current one."
+    else
+      pw_probe_fate="The password staged at ${HELPER_PASS_FILE} has been KEPT: a pre-staged credential is the operator's, never this script's to delete. Correct that file (root-only, 0600) and re-run the one-liner:
+  install -m 600 /dev/null ${HELPER_PASS_FILE} && printf '%s' '<password>' > ${HELPER_PASS_FILE}"
+    fi
+    die "the helper REFUSED this password — nothing has been provisioned.
+No VM, no user, no sshd change, and not one byte fetched: this was a password-only login against ${helper} on :${port}, made exactly once, before the bootstrap fetched anything.
+${pw_probe_fate}
+WHY THIS STOPS THE RUN RATHER THAN CARRYING ON (issue #877). The helper may well accept this box's KEY and let the whole bootstrap complete — that is precisely how a stale password reached a live estate on 2026-09-19. The password is a credential in its OWN right: rclone's sftp backend, which backs the players up, can authenticate with nothing else. Carried untested it fails ninety minutes later, inside the VMs, with nothing on the console pointing back here.
+NOT retrying: each attempt is a real login against the helper and repeated failures can get this estate's IP banned by the helper's provider (issues #87/#90)."
+  else
+    warn "could not verify the password (${pw_probe_why}: $(printf '%s' "$pw_probe_out" | tr '\n' ';')) — continuing; the first password-only consumer is the players' backup tool"
+    hook_probe_knock=1
+    [[ $pw_probe_class == banned ]] && banner_closes=1
+  fi
+fi
+unset pw_probe_out pw_probe_rc pw_probe_class pw_probe_fate pw_probe_why
+
+attempts=$hook_probe_knock
 max_attempts="${PROVISIONER_HOOK_FETCH_MAX_ATTEMPTS:-5}"
 [[ $max_attempts =~ ^[0-9]+$ ]] && (( max_attempts >= 1 )) || max_attempts=5
 while :; do
