@@ -742,8 +742,8 @@ dpkg confirms no owner) then re-run. apt said: $(printf '%s' "$out" | grep -iE "
   die "could not install git, so this box cannot fetch the provisioner code (issue #169).
 The pre-repo phase needs exactly one package and this is it. Check apt on this host:
   apt-get update ; apt-get install -y git
-A PVE host with no subscription 401s on the enterprise repo — that alone is harmless, the
-no-subscription repo carries git. Nothing has been provisioned (no VM, no user).
+A PVE host with no subscription 401s on the enterprise repo — that alone is harmless, git
+comes from Debian's own repos. Nothing has been provisioned (no VM, no user).
 apt said: $(printf '%s' "$out" | tail -3)"
 }
 
