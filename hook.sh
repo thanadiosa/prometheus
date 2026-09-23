@@ -729,7 +729,7 @@ $1"
     log "git installed ($(git --version 2>/dev/null || echo 'version unknown'))"
     return 0
   fi
-  if printf '%s' "$out" | grep -qiE "$HOOK_APT_LOCK_RE"; then
+  if grep -qiE "$HOOK_APT_LOCK_RE" <<<"$out"; then
     die "could not install git: something else on this box still holds the package manager, after apt waited ${HOOK_APT_LOCK_WAIT}s for it (issue #303).
 This is NOT an apt misconfiguration and running apt by hand now will fail the same way. A
 freshly installed Proxmox host runs its own first-boot updates; wait for them to finish:
