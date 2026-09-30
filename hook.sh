@@ -247,6 +247,7 @@ if [[ -e $RD_FACT_FILE ]]; then
 fi
 
 RD_SRC=""
+RD_PROBE=0            # 1 = nothing named the directory: probe the helper for it (issue #1081)
 if [[ -n $embedded_rd ]]; then
   [[ -n $_RD && $_RD != "$embedded_rd" ]] \
     && say "helper remote dir: using '${embedded_rd}' from the combined address (overriding PROVISIONER_REMOTE_DIR='${_RD}')"
@@ -260,12 +261,9 @@ elif (( RD_FACT_HAVE )); then
   _RD="$RD_FACT"
   RD_SRC="${RD_FACT_FILE}, this box's own staged fact"
   log "helper remote dir '${_RD}' read from ${RD_FACT_FILE} — the layout a previous lap staged on this host, which beats guessing the well-known base (issue #834)"
-elif [[ $auth_hint == key ]]; then
-  _RD="$HELPER_DEFAULT_SSH_RD"
-  RD_SRC="the well-known ssh base — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
-  log "helper remote dir defaulted to '${_RD}' (issue #300: known key/ssh helper, no path given, no staged fact)"
 else
-  RD_SRC="the helper's login/chroot root — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
+  RD_PROBE=1
+  RD_SRC="probing the helper — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
 fi
 (( RD_FACT_UNREADABLE )) \
   && say "this box carries ${RD_FACT_FILE} but it could not be read — the layout it names was NOT used (issue #834). Check it with: ls -l ${RD_FACT_FILE}"
@@ -345,6 +343,7 @@ hook_find_askpass_dir() {
   return 1
 }
 
+hook_sftp_to=()   # optional `timeout N` prefix for the session (the #1081 probe sets it)
 hook_sftp_pass() {
   local ap rc
   if [[ ${PROVISIONER_HELPER_PASS_MODE:-auto} != sshpass ]] && hook_askpass_ok \
@@ -358,13 +357,13 @@ hook_sftp_pass() {
     chmod 700 "$ap" || { rm -f "$ap"; return 255; }
     PROVISIONER_ASKPASS_FILE="$HELPER_PASS_FILE" SSH_ASKPASS="$ap" \
     SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-}" \
-      sftp "${sftp_opts[@]}" "$helper" 2>&1
+      "${hook_sftp_to[@]}" sftp "${sftp_opts[@]}" "$helper" 2>&1
     rc=$?
     rm -f "$ap"
     return $rc
   fi
   if command -v sshpass >/dev/null 2>&1; then
-    sshpass -f "$HELPER_PASS_FILE" sftp "${sftp_opts[@]}" "$helper" 2>&1
+    "${hook_sftp_to[@]}" sshpass -f "$HELPER_PASS_FILE" sftp "${sftp_opts[@]}" "$helper" 2>&1
     return $?
   fi
   if hook_askpass_ok; then
@@ -443,6 +442,11 @@ hook_probe_knock=0      # 1 once the #877 probe has spent a failed login (see be
 fetch_lib() {
   fetch_fail_reason=""
   local out rc key_fail=""
+  if (( RD_PROBE )); then
+    hook_probe_remote_dir "$estate"; rc=$?
+    (( rc == 0 )) || return "$rc"
+    (( hook_probe_have_lib )) && [[ -s ./helper-lib.sh ]] && return 0
+  fi
   if [[ $auth_hint != password ]]; then
     out="$(timeout "${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}" \
       scp -v -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes \
@@ -569,6 +573,92 @@ NOT retrying: each attempt is a real login against the helper and repeated failu
 fi
 unset pw_probe_out pw_probe_rc pw_probe_class pw_probe_fate pw_probe_why
 
+hook_probe_have_lib=0   # 1 = the probe left a verified ./helper-lib.sh
+hook_probe_via=""   # key | password: which session answered (set by hook_probe_transport)
+hook_probe_transport() {   # stdin: sftp `get` lines -> transcript on stdout, the session's rc
+  local cmds out="" rc=255 t="${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}"
+  cmds="$(cat)"; hook_probe_via=""
+  if [[ $auth_hint != password ]]; then
+    out="$(printf '%s\n' "$cmds" | sed 's/^/-/' | timeout "$t" \
+      sftp -v -b - -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes \
+        "${cm_opts[@]}" "${key_id_opt[@]}" "$helper" 2>&1)"; rc=$?
+    if [[ $rc -eq 0 ]]; then hook_probe_via=key; printf '%s\n' "$out"; return 0; fi
+    case "$(classify_ssh_failure "$out" "$rc")" in transport|banned) printf '%s\n' "$out"; return "$rc";; esac
+  fi
+  if [[ -s $HELPER_PASS_FILE ]]; then
+    hook_sftp_to=(timeout "$t")
+    hook_sftp_pass <<<"$cmds"; rc=$?
+    hook_sftp_to=()
+    (( rc == 0 )) && hook_probe_via=password
+    return $rc
+  fi
+  printf '%s\n' "$out"; return "$rc"
+}
+hook_probe_remote_dir() {   # <estate> — sets _RD, RD_SRC and the derived paths, or returns/dies
+  local est="${1:-}" work out rc cmds="" i nf missing=0 cand
+  local -a cands=("${HELPER_DEFAULT_SSH_RD}/${est}" "") verdict=()
+  [[ $est =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $est != *..* ]] \
+    || die "cannot look for this estate's folder on the helper: the estate name '${est}' is not a plain name. Re-run with PROVISIONER_REMOTE_DIR set (empty for a per-estate login root)."
+  work="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/.prov-rdprobe.XXXXXX")" \
+    || die "cannot create a scratch directory to probe the helper's layout in (${TMPDIR:-/tmp})"
+  for i in 0 1; do
+    cmds+="get ${cands[i]:+${cands[i]}/}scripts/helper-lib.sh ${work}/c${i}"$'\n'
+  done
+  hook_probe_transport <<<"$cmds" > "${work}/out"; rc=$?
+  out="$(<"${work}/out")"
+  nf="$(grep -c -i -e 'no such file' -e 'not found' <<<"$out")"
+  for i in 0 1; do [[ -s ${work}/c${i} ]] || missing=$((missing + 1)); done
+  for i in 0 1; do
+    if [[ -s ${work}/c${i} ]]; then verdict[i]=present
+    elif [[ $rc -eq 0 && ${nf:-0} -ge $missing ]]; then verdict[i]=absent
+    else verdict[i]=unknown; fi
+  done
+  local keep="" both=0
+  for i in 0 1; do [[ ${verdict[i]} == present ]] && keep="${work}/c${i}"; done
+  if [[ ${verdict[0]} == present && ${verdict[1]} == present ]]; then both=1; keep="${work}/c0"; fi
+  if [[ -n $keep && ( $both -eq 1 || ${verdict[0]} != "${verdict[1]}" ) ]]; then
+    cp "$keep" ./helper-lib.sh 2>/dev/null && [[ -s ./helper-lib.sh ]] || { rm -f ./helper-lib.sh; keep=""; }
+  else keep=""; fi
+  rm -rf "$work"
+  local where0="'${cands[0]}'" where1="the helper login root"
+  if (( both )); then
+    warn "the helper login root also holds boot scripts; ignored, this estate's own folder ${where0} wins (a leftover, issue #1081)"
+    verdict[1]=absent
+  fi
+  if [[ ${verdict[0]} == unknown || ${verdict[1]} == unknown ]]; then
+    fetch_fail_reason="could not tell where this estate's boot scripts are on the helper: ${where0} was '${verdict[0]}' and ${where1} '${verdict[1]}' ('could not list' is not 'absent', issue #1081).
+  failure class: $([[ $rc -ne 0 ]] && classify_ssh_failure "$out" "$rc" || printf 'listing refused (session completed)') — the transcript is not printed: it names the helper's address.
+Nothing has been fetched or changed. Fix the cause, or name the directory: re-run with PROVISIONER_REMOTE_DIR=<dir> (empty for a per-estate login root)."
+    if [[ $rc -ne 0 ]]; then
+      case "$(classify_ssh_failure "$out" "$rc")" in
+        transport) return 1;;
+        banned)
+          banner_closes=$((banner_closes + 1))
+          (( banner_closes >= 2 )) && return 3
+          return 1;;
+      esac
+    fi
+    return 3
+  fi
+  for i in 0 1; do
+    [[ ${verdict[i]} == present ]] || continue
+    _RD="${cands[i]}"
+    cand="${_RD:-the helper login root}"
+    RD_SRC="probing the helper — ${cand} holds scripts/helper-lib.sh and the other candidate does not (issue #1081)"
+    say "helper remote dir: found this estate's boot scripts in ${cand} (nothing was typed or set; both layouts were checked)"
+    SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
+    SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
+    LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
+    DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy"
+    VERSION_REMOTE="${_RD:+${_RD}/}version"
+    RD_PROBE=0
+    [[ $hook_probe_via == key && -n $keep ]] && hook_note_verified_id "$out"
+    [[ -n $keep ]] && hook_probe_have_lib=1
+    return 0
+  done
+  die "this estate's boot scripts are on the helper in NEITHER place it looked: ${where0} (shared account, one folder per estate) nor ${where1} (per-estate account). The login worked; scripts/helper-lib.sh is in neither.
+Nothing has been fetched or changed. Check what is staged where before re-staging anything (issue #313), or name the directory: PROVISIONER_REMOTE_DIR=<dir>."
+}
 attempts=$hook_probe_knock
 max_attempts="${PROVISIONER_HOOK_FETCH_MAX_ATTEMPTS:-5}"
 [[ $max_attempts =~ ^[0-9]+$ ]] && (( max_attempts >= 1 )) || max_attempts=5
@@ -862,7 +952,7 @@ fi
 
 if [[ -n $PROVISIONER_VERSION && -r $NEEDLE_MAIN ]] \
    && command -v grep >/dev/null 2>&1 \
-   && ! grep -q 'PROVISIONER_VERSION' "$NEEDLE_MAIN" 2>/dev/null; then
+   && ! grep -qs 'PROVISIONER_VERSION' "$NEEDLE_MAIN" "${NEEDLE_MAIN%/*}"/needle-*.sh; then   # needle is split into parts since #948 (#1086)
   say "WARNING: version '${PROVISIONER_VERSION}' PREDATES version pinning (issue #232).
 This host will run it, but the needle at that commit cannot pass the version on, so the CONTROL
 NODE it builds will clone the NEWEST code instead — one estate built from two versions.
