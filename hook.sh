@@ -1074,6 +1074,14 @@ different one under that label is the exact failure this check exists to prevent
 Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provisioned."
 fi
 
+PROVISIONER_RESTORE_LEGACY_AGAIN="${PROVISIONER_RESTORE_LEGACY_AGAIN:-}"
+if [[ -n $PROVISIONER_RESTORE_LEGACY_AGAIN && $PROVISIONER_RESTORE_LEGACY_AGAIN != all \
+      && ( ! $PROVISIONER_RESTORE_LEGACY_AGAIN =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}(,[A-Za-z0-9_][A-Za-z0-9_-]{0,63})*$ || ,${PROVISIONER_RESTORE_LEGACY_AGAIN}, == *,all,* ) ]]; then
+  die "$(printf 'PROVISIONER_RESTORE_LEGACY_AGAIN %q is not usable (#1127).' "$PROVISIONER_RESTORE_LEGACY_AGAIN")
+Give item names (letters, digits, - and _, at most 64 characters, not starting with -) separated by commas, or the word all, or leave it empty.
+Nothing has been provisioned."
+fi
+
 if [[ -n $PROVISIONER_VERSION ]]; then
   log "building provisioner version '${PROVISIONER_VERSION}' (from ${version_src})"
 else
@@ -1442,6 +1450,7 @@ _compare_staged_to_checkout
 export PROVISIONER_REPO_DIR="$REPO_DIR"
 export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
 export PROVISIONER_VERSION
+export PROVISIONER_RESTORE_LEGACY_AGAIN   # #1127: one run only, never stored
 
 log "handing off to the checkout's needle: ${NEEDLE_MAIN}"
 _hook_feed_line "[hook] pre-repo phase complete — handing off to the checkout's needle"
