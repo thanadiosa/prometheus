@@ -537,6 +537,18 @@ _helper_crypt_on() {
 }
 _helper_crypt_khfile() { printf '%s' "${HOME:-/root}/.ssh/known_hosts"; }
 _helper_crypt_obscure() { sed -n "${2}p" "$1" | tr -d '\r' | rclone obscure - 2>/dev/null; }
+_helper_crypt_hostkey_algs() {
+  local kh h spec t out=""; kh="$(_helper_crypt_khfile)"; h="${HELPER#*@}"
+  case "$HELPER_PORT" in ""|22) spec="$h" ;; *) spec="[$h]:$HELPER_PORT" ;; esac
+  [ -f "$kh" ] || return 0
+  while read -r t; do   # read, not word-splitting: no globbing of odd known_hosts text
+    case "$t" in ''|*[!A-Za-z0-9@._-]*) continue ;; esac
+    [ "$t" = ssh-rsa ] && t="rsa-sha2-512 rsa-sha2-256 ssh-rsa"
+    case " $out " in *" $t "*) ;; *) out="${out:+$out }$t" ;; esac
+  done < <(ssh-keygen -F "$spec" -f "$kh" 2>/dev/null | awk '$1 !~ /^[#@]/ {print $2}')
+  [ -z "$out" ] || printf 'host_key_algorithms = %s\n' "$out"
+  return 0
+}
 _helper_crypt_sftp_stanza() {
   local kh ob; kh="$(_helper_crypt_khfile)"
   printf '[prov-sftp]\ntype = sftp\nhost = %s\nuser = %s\nport = %s\n' "${HELPER#*@}" "${HELPER%%@*}" "$HELPER_PORT"
@@ -549,6 +561,7 @@ _helper_crypt_sftp_stanza() {
   [ -n "$HELPER_CIPHERS" ] && printf 'ciphers = %s\n' "${HELPER_CIPHERS//,/ }"
   [ -n "$HELPER_MACS" ] && printf 'macs = %s\n' "${HELPER_MACS//,/ }"
   printf 'known_hosts_file = %s\n' "$kh"
+  _helper_crypt_hostkey_algs
   printf 'set_modtime = false\ndisable_hashcheck = true\n'
   return 0
 }
@@ -1038,10 +1051,13 @@ Nothing has been changed on this host."
 fi
 
 ref_is_sane() {
-  local r="${1:-}"
+  local r="${1:-}" t
   [[ -n $r ]] || return 1
   [[ $r == *..* ]] && return 1
-  [[ $r =~ ^[A-Za-z0-9][A-Za-z0-9._/+-]{0,127}$ ]]
+  [[ $r =~ ^[A-Za-z0-9][A-Za-z0-9._/+-]{0,127}$ ]] || return 1
+  t="${r#refs/tags/}"; t="${t#tags/}"
+  [[ $t =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+)*([-+].*)?$ && ! $t =~ ^[0-9]{2}\.(0[1-9]|1[0-2])\.(00[1-9]|0[1-9][0-9]|[1-9][0-9]{2})$ ]] && return 1
+  return 0
 }
 
 PROVISIONER_VERSION="${PROVISIONER_VERSION:-}"
@@ -1067,8 +1083,8 @@ version_where="the environment (PROVISIONER_VERSION)"
 if [[ -n $PROVISIONER_VERSION ]] && ! ref_is_sane "$PROVISIONER_VERSION"; then
   die "$(printf 'the requested provisioner version %q is not a usable git ref (issue #232).' "$PROVISIONER_VERSION")
 It came from ${version_where}.
-A version is a tag, a branch, or a full commit sha: letters, digits and . _ / + - only, no
-leading '-', no '..', at most 128 characters.
+A version is a YY.MM.NNN tag (expected like 26.10.001; old names such as 0.2.0 are gone, #1134), a branch,
+or a full commit sha: letters, digits and . _ / + - only, no leading '-', no '..', at most 128 characters.
 NOT falling back to the newest code: you asked for a specific version, and building a
 different one under that label is the exact failure this check exists to prevent.
 Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provisioned."
