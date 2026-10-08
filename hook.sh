@@ -234,6 +234,7 @@ fi
 
 HELPER_CRYPT_KEY="${STATE_DIR}/helper-crypt-key"
 HELPER_CRYPT_NONE="${STATE_DIR}/helper-crypt-none"
+HELPER_ACCESS="${STATE_DIR}/helper-access"   # #1202: the access path without encryption; a line "rclone"
 hook_tty_dev=/dev/tty          # a variable, not an env knob: the tests point it at a pty
 hook_crypt_minted=0; hook_crypt_new_estate=0
 hook_crypt_store() {   # <password> <salt> -> the stored key, atomically, 0600
@@ -261,13 +262,19 @@ hook_crypt_key_interview() {
   elif [[ -n $src ]]; then
     hook_crypt_from_file "$src" || die "PROVISIONER_HELPER_CRYPT_KEY_FILE names ${src}, which is missing, unreadable or has an empty first line (line 1 = password, line 2 = salt)."
     log "the seedbox encryption key was read from the file you named and stored at ${HELPER_CRYPT_KEY}"
+  elif [[ ${PROVISIONER_HELPER_ACCESS:-} == rclone ]] || { [[ -s $HELPER_ACCESS && ! -e $HELPER_CRYPT_NONE ]]; }; then   # #1202: third answer, no key
+    [[ ${PROVISIONER_HELPER_ACCESS:-} != rclone ]] || rm -f "$HELPER_CRYPT_NONE"   # an explicit setting is newer than an old "none"
+    [[ -s $HELPER_ACCESS ]] || ( umask 022; printf 'rclone\n' > "$HELPER_ACCESS" ) || die "could not record the access-path setting at ${HELPER_ACCESS}"
+    log "seedbox reached through the access path without encryption (#1202; remove ${HELPER_ACCESS} to be asked again)"
   elif [[ -e $HELPER_CRYPT_NONE ]]; then
     log "no seedbox encryption (chosen on an earlier run; remove ${HELPER_CRYPT_NONE} to be asked again, or name a key file in PROVISIONER_HELPER_CRYPT_KEY_FILE)"
   elif [[ $have_tty == 1 ]]; then
     for n in 1 2 3; do
-      read -rp "encrypt this estate's seedbox folder (only a new or already-encrypted one; an existing plain folder must be moved first)? n = no (default) / g = generate a key for me / t = type the key I already have: " ans <"$hook_tty_dev"
+      read -rp "encrypt this estate's seedbox folder (only a new or already-encrypted one; an existing plain folder must be moved first)? n = no (default) / a = no encryption but reach it through the access path (an encrypted folder is refused at first use) / g = generate a key for me / t = type the key I already have: " ans <"$hook_tty_dev"
       case "${ans:-n}" in
         n|N|no) ( umask 077; : > "$HELPER_CRYPT_NONE" ) 2>/dev/null; log "no seedbox encryption chosen"; break ;;
+        a|A) ( umask 022; printf 'rclone\n' > "$HELPER_ACCESS" ) || die "could not record the access-path setting at ${HELPER_ACCESS}"
+             log "no seedbox encryption; the seedbox is reached through the access path (#1202)"; break ;;
         g|G)
           pw="$(hook_crypt_rand)"; salt="$(hook_crypt_rand)"
           [[ ${#pw} -ge 32 && ${#salt} -ge 32 ]] || die "could not read random bytes to make a key - nothing was stored"
@@ -287,14 +294,15 @@ hook_crypt_key_interview() {
           IFS= read -rsp "seedbox key salt (empty for none): " salt <"$hook_tty_dev"; printf '\n' >"$hook_tty_dev"
           hook_crypt_store "$pw" "$salt" || die "could not store the key at ${HELPER_CRYPT_KEY}"
           unset pw pw2 salt; break ;;
-        *) say "answer n, g or t" ;;
+        *) say "answer n, a, g or t" ;;
       esac
       (( n == 3 )) && die "no usable answer to the encryption question"
     done
-    [[ -s $HELPER_CRYPT_KEY || -e $HELPER_CRYPT_NONE ]] \
+    [[ -s $HELPER_CRYPT_KEY || -e $HELPER_CRYPT_NONE || -s $HELPER_ACCESS ]] \
       || die "no encryption key was stored and 'none' was not chosen - stopping rather than carrying on unencrypted by accident"
   fi
   [[ -s $HELPER_CRYPT_KEY ]] && unset PROVISIONER_HELPER_CRYPT_KEY_FILE
+  if [[ -s $HELPER_CRYPT_KEY || -e $HELPER_CRYPT_NONE ]]; then rm -f "$HELPER_ACCESS"; fi   # (an explicit setting already cleared "none")
   [[ -s $HELPER_CRYPT_KEY || ${PROVISIONER_HELPER_CRYPT:-} != required ]] \
     || die "PROVISIONER_HELPER_CRYPT=required but no seedbox encryption key is stored at ${HELPER_CRYPT_KEY}"
   [[ $hook_crypt_minted == 1 && $hook_crypt_new_estate == 1 ]] && export PROVISIONER_HELPER_CRYPT_INIT=1
@@ -524,16 +532,25 @@ _HELPER_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout="${HELPE
 [ -n "$HELPER_MACS" ] && _HELPER_SSH_OPTS+=(-o MACs="$HELPER_MACS")
 _HELPER_AUTH=""
 P=""
-_HELPER_AUTH_RE='permission denied|authentication failed|no more authentication methods|too many authentication failures|access denied'
+_HELPER_AUTH_RE='permission denied ?\(|permission denied, please|authentication failed|no more authentication methods|too many authentication failures|access denied|unable to authenticate'
 _HELPER_XPORT_RE='connection (timed out|closed|reset)|lost connection|broken pipe|connection to .* closed|no route to host|network is unreachable|banner exchange|kex_exchange|client_loop|write failed|message authentication code'
 
 say() { printf '[crypt-fetch] %s\n' "$*" >&2; }
 
 _helper_crypt_keyfile() { printf '%s' "${PROVISIONER_HELPER_CRYPT_KEY_FILE:-/etc/provisioner/helper-crypt-key}"; }
-_helper_crypt_on() {
+_helper_crypt_keyed() {
   [ -n "${PROVISIONER_HELPER_CRYPT_KEY_FILE:-}" ] && return 0
   [ "${PROVISIONER_HELPER_CRYPT:-}" = required ] && return 0
   [ -s "$(_helper_crypt_keyfile)" ]
+}
+_helper_crypt_alias() {
+  _helper_crypt_keyed && return 1
+  [ "${PROVISIONER_HELPER_ACCESS:-}" = rclone ] && return 0
+  [ "$(head -n 1 "${PROVISIONER_HELPER_ACCESS_FILE:-/etc/provisioner/helper-access}" 2>/dev/null | tr -d '[:space:]')" = rclone ]
+}
+_helper_crypt_on() {
+  _helper_crypt_keyed && return 0
+  _helper_crypt_alias
 }
 _helper_crypt_khfile() { printf '%s' "${HOME:-/root}/.ssh/known_hosts"; }
 _helper_crypt_obscure() { sed -n "${2}p" "$1" | tr -d '\r' | rclone obscure - 2>/dev/null; }
@@ -569,6 +586,12 @@ _helper_crypt_remote_stanza() {   # <obscured password> [<obscured salt>]
   printf '[prov-crypt]\ntype = crypt\nremote = prov-sftp:\nfilename_encryption = standard\ndirectory_name_encryption = true\npassword = %s\n' "$1"
   [ -z "${2:-}" ] || printf 'password2 = %s\n' "$2"
 }
+_helper_crypt_looks_encrypted() {
+  local t; t="$(cat)"
+  grep -qxE '(scripts|secrets|images|state|restic|version|version-built|downloads)/?' <<<"$t" && return 1
+  grep -qE '^[0-9a-v]{26,}/?$' <<<"$t"
+}
+_helper_crypt_alias_stanza() { printf '[prov-crypt]\ntype = alias\nremote = prov-sftp:\n'; }
 _helper_crypt_local() { case "$1" in /*|./*) printf '%s' "$1" ;; *) printf './%s' "$1" ;; esac; }
 _helper_crypt_p() {
   local p="$1"
@@ -619,8 +642,10 @@ crypt_get() {
     *) say "auth must be key or password"; return 4 ;;
   esac
   kf="$(_helper_crypt_keyfile)"
-  [ -s "$kf" ] || { say "crypt key file missing or empty - refusing to fall back to PLAINTEXT"; return 4; }
-  [ -z "$(find "$kf" -maxdepth 0 -perm /077 2>/dev/null)" ] || { say "crypt key file is group/other accessible - chmod 600"; return 4; }
+  if ! _helper_crypt_alias; then   # #1202: the plain access path has no key to check
+    [ -s "$kf" ] || { say "crypt key file missing or empty - refusing to fall back to PLAINTEXT"; return 4; }
+    [ -z "$(find "$kf" -maxdepth 0 -perm /077 2>/dev/null)" ] || { say "crypt key file is group/other accessible - chmod 600"; return 4; }
+  fi
   command -v rclone >/dev/null 2>&1 || { say "rclone is not installed"; return 4; }
   rp="$(_helper_crypt_p "$remote")" || { say "refused path"; return 4; }
   _crypt_hostkey || { say "no host key on record for the helper and first contact did not record one - refusing an unverified host"; return 5; }
@@ -635,15 +660,21 @@ crypt_get() {
   DST="$dst"; TMPDST="${dst}.prov-part.$$"
   trap 'rm -rf "$D"' EXIT
   trap 'kill "$P" 2>/dev/null; rm -rf "$D"; rm -f "$TMPDST" "$DST".prov-part.*; exit 130' INT; trap 'kill "$P" 2>/dev/null; rm -rf "$D"; rm -f "$TMPDST" "$DST".prov-part.*; exit 143' TERM; trap 'kill "$P" 2>/dev/null; rm -rf "$D"; rm -f "$TMPDST" "$DST".prov-part.*; exit 129' HUP
-  local pw salt want
-  pw="$(_helper_crypt_obscure "$kf" 1)"; salt="$(_helper_crypt_obscure "$kf" 2)"; want="$(sed -n 2p "$kf" | tr -d '\r')"
-  { [ -n "$pw" ] && { [ -z "$want" ] || [ -n "$salt" ]; }; } || { say "the crypt key file could not be obscured"; return 4; }
+  local pw="" salt="" want=""
+  if ! _helper_crypt_alias; then
+    pw="$(_helper_crypt_obscure "$kf" 1)"; salt="$(_helper_crypt_obscure "$kf" 2)"; want="$(sed -n 2p "$kf" | tr -d '\r')"
+    { [ -n "$pw" ] && { [ -z "$want" ] || [ -n "$salt" ]; }; } || { say "the crypt key file could not be obscured"; return 4; }
+  fi
   ( umask 077
     { _helper_crypt_sftp_stanza || exit 1
-      _helper_crypt_remote_stanza "$pw" "$salt"
+      if _helper_crypt_alias; then _helper_crypt_alias_stanza; else _helper_crypt_remote_stanza "$pw" "$salt"; fi
     } > "${D}/rclone.conf" ) 2>/dev/null || { say "could not build the rclone config"; return 4; }
   chmod 600 "${D}/rclone.conf"
-  timeout -k 5 "${PROVISIONER_CRYPT_FETCH_TIMEOUT:-120}" rclone --config "${D}/rclone.conf" --contimeout "${HELPER_CONNECT_TIMEOUT}s" \
+  if _helper_crypt_alias; then   # #1202: an encrypted folder read without its key looks empty - refuse, do not call it "not there"
+    rclone --config "${D}/rclone.conf" --contimeout "${HELPER_CONNECT_TIMEOUT}s" --retries 1 --low-level-retries 1 lsf prov-crypt: 2>/dev/null </dev/null | _helper_crypt_looks_encrypted \
+      && { say "this folder is encrypted; the access path without a key would read it as empty - refusing (#1202)"; return 4; }
+  fi
+  timeout -k 5 "${PROVISIONER_CRYPT_FETCH_TIMEOUT:-120}" rclone --config "${D}/rclone.conf" --contimeout "${HELPER_CONNECT_TIMEOUT}s" --retries 1 --low-level-retries 1 \
     copyto -- "$rp" "$(_helper_crypt_local "$TMPDST")" >/dev/null 2>"${D}/err" </dev/null &
   P=$!; wait "$P"; rc=$?
   [ "$rc" = 0 ] && { [ -s "$TMPDST" ] && mv -f "$TMPDST" "$dst" && return 0; rm -f "$TMPDST"; say "rclone exited 0 but ${dst} is empty or missing"; return 1; }
@@ -663,6 +694,7 @@ crypt_get() {
 
 case "${1:-}" in
   on)            _helper_crypt_on ;;
+  keyed)         _helper_crypt_keyed ;;   # #1202: told apart from the plain access path
   ensure-rclone) ensure_rclone ;;
   get)           [ "$#" = 4 ] || { say "usage: get <key|password> <remote> <local>"; exit 4; }; crypt_get "$2" "$3" "$4" ;;
   *)             say "usage: on | ensure-rclone | get <key|password> <remote> <local>"; exit 4 ;;
@@ -956,7 +988,7 @@ Nothing has been fetched or changed. Fix the cause, or name the directory: re-ru
     [[ -n $keep ]] && hook_probe_have_lib=1
     return 0
   done
-  if ! hook_crypt_on && hook_crypt_folder_looks_encrypted "${cands[0]}"; then
+  if ! hook_crypt keyed && hook_crypt_folder_looks_encrypted "${cands[0]}"; then
     die "this estate's boot scripts are not on the helper, and the folder holds only names this estate does not use. That is how an encrypted folder looks, but it can also be a folder that was never staged. This host has no encryption key. If the folder is encrypted: set PROVISIONER_HELPER_CRYPT_KEY_FILE to the key file, or run again from a terminal and choose 't' (first remove ${HELPER_CRYPT_NONE} if it exists, or you will not be asked, issue #1076). If it is not encrypted: stage the boot scripts there (issue #313). Nothing was written to the helper."
   fi
   die "this estate's boot scripts are on the helper in NEITHER place it looked: ${where0} (shared account, one folder per estate) nor ${where1} (per-estate account). The login worked; scripts/helper-lib.sh is in neither.
