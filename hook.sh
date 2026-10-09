@@ -1078,11 +1078,23 @@ _log_prerepo_fingerprints() {
 }
 _log_prerepo_fingerprints
 
-if helper_detect; then
+_hd_err="$(mktemp 2>/dev/null)" || _hd_err=/dev/null
+helper_detect 2>"$_hd_err"; _hd_rc=$?
+_hd_last=""
+if [[ -s $_hd_err ]]; then
+  cat "$_hd_err" >&2
+  while IFS= read -r _hd_line; do
+    _hook_log_file "$_hd_line"
+    [[ $_hd_line == "[helper-lib]"* ]] && _hd_last="$_hd_line"
+  done < "$_hd_err"
+fi
+[[ $_hd_err == /dev/null ]] || rm -f "$_hd_err"
+if (( _hd_rc == 0 )); then
   milestone "seedbox reachable (auth=$(helper_auth), channel=$(helper_channel)) — cold start begins for ${estate}"
 else
   die "cannot reach helper '${helper}' on port ${port} — the deploy key and the seed images both live there, so nothing can proceed.
-Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them (issue #143).
+${_hd_last:+Last library line: ${_hd_last}
+}Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them (issue #143).
 Nothing has been changed on this host."
 fi
 
