@@ -702,6 +702,7 @@ esac
 }
 hook_crypt() { bash -c "$(declare -f hook_crypt_fetch_main); hook_crypt_fetch_main \"\$@\"" helper-crypt-fetch "$@"; }
 hook_crypt_on() { hook_crypt on; }
+hook_access_path_only() { hook_crypt_on && ! hook_crypt keyed; }
 hook_crypt_get() {
   HELPER="$helper" PROVISIONER_HELPER_PORT="$port" PROVISIONER_HELPER_PASS_FILE="$HELPER_PASS_FILE" \
     PROVISIONER_HELPER_ID="$hook_crypt_key" hook_crypt get "$@"
@@ -733,7 +734,8 @@ hook_crypt_probe() {   # <workdir> <cand0> <cand1>
     case "$rc" in
       0) ;;
       3) printf 'remote open("%s"): No such file or directory\n' "$c" ;;
-      2) printf 'Permission denied (password).\n'; worst=255 ;;
+      2) printf 'Permission denied (password).\n'; worst=255   # a refused login ends the probe: a second candidate would be a second sign-in (#1203)
+         log "the helper REFUSED the login - not retried on the second candidate (#1201, #1203)"; break ;;
       4) printf 'crypt mode could not run (see above)\n'; worst=255 ;;
       5) printf 'Host key verification failed.\n'; worst=255 ;;
       *) printf 'Connection timed out\n'; worst=255 ;;
@@ -863,7 +865,9 @@ _pw_probe_offered_password() {   # <transcript> → 1 ONLY when a method list pr
 }
 
 pw_probe_out=""; pw_probe_rc=0; pw_probe_class=""; pw_probe_fate=""; pw_probe_why=""
-if [[ -s $HELPER_PASS_FILE ]]; then
+if [[ -s $HELPER_PASS_FILE ]] && hook_access_path_only; then
+  log "access path: the password is proven by the first fetch, not by a separate sign-in (#1203)"
+elif [[ -s $HELPER_PASS_FILE ]]; then
   pw_probe_out="$(printf 'exit\n' | hook_sftp_pass)"; pw_probe_rc=$?
   pw_probe_class="$(classify_ssh_failure "$pw_probe_out" "$pw_probe_rc")"
   if [[ $pw_probe_class == auth ]] && ! _pw_probe_offered_password "$pw_probe_out"; then
