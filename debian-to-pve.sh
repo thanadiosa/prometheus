@@ -338,6 +338,27 @@ verify_apt() {
   apt_q update || die "APT CHECK: apt-get update fails after the enterprise sources were disabled (see ${LOG_FILE})"
 }
 
+# A Proxmox ISO install writes /etc/pve/storage.cfg; the apt install serves an implicit `local`
+# in memory and writes nothing, so host-prep abstains and no data disk becomes vmdata (#1237).
+# Write the ISO default for a dir-only root: pvesm first (goes through the cluster fs), else the file.
+ensure_storage_cfg() {
+  local d="${ROOT}/etc/pve" f="${ROOT}/etc/pve/storage.cfg" _
+  for _ in $(seq 1 30); do [[ -w "$d" ]] && break; sleep 2; done
+  [[ -w "$d" ]] || die "/etc/pve is not writable after 60 s: pve-cluster is not up"
+  [[ -e "$f" ]] && return 0
+  real pvesm set local --content iso,vztmpl,backup >>"$LOG_FILE" 2>&1
+  if [[ ! -e "$f" ]]; then
+    warn "pvesm did not write ${f}; writing the ISO default directly"
+    printf 'dir: local\n\tpath /var/lib/vz\n\tcontent iso,vztmpl,backup\n' > "$f" || die "cannot write ${f}"
+  fi
+  log "storage.cfg written: dir local, /var/lib/vz"
+}
+
+verify_storage_cfg() {
+  grep -q '^dir: local[[:space:]]*$' "${ROOT}/etc/pve/storage.cfg" 2>/dev/null \
+    || die "STORAGE CHECK: /etc/pve/storage.cfg is missing or does not name 'local': host-prep would find no storage"
+}
+
 # Last word before the reboot: the file we will boot into must carry vmbr0 with the address and
 # gateway, bound to a port the .link file names for this MAC (#1237). Re-reads from disk.
 verify_network() {  # <cidr> <gateway> <mac>
@@ -385,6 +406,9 @@ phase2() {
   log "$(pveversion 2>&1)"
   local _; for _ in $(seq 1 30); do probe_web && break; sleep 2; done
   probe_web || die "port 8006 does not answer locally after 60 s"
+
+  ensure_storage_cfg
+  verify_storage_cfg
 
   disarm_resume
   : > "$DONE_MARK"
