@@ -24,6 +24,8 @@
 set -uo pipefail
 
 ROOT="${DEBIAN_TO_PVE_PROBE_DIR:-}"
+PORT_NAME=nic0   # our own name for the uplink card, pinned by MAC (#1237)
+LINK_FILE="${ROOT}/etc/systemd/network/10-provisioner-uplink.link"
 SELF_DST="${ROOT}/usr/local/sbin/provisioner-debian-to-pve"
 UNIT="provisioner-debian-to-pve.service"
 UNIT_FILE="${ROOT}/etc/systemd/system/${UNIT}"
@@ -57,6 +59,7 @@ probe_pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 
 probe_running_kernel() { uname -r; }
 probe_uplink() { ip -o -4 route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1; }
 probe_gateway() { ip -o -4 route show default 2>/dev/null | sed -n 's/.* via \([^ ]*\).*/\1/p' | head -n1; }
+probe_mac() { tr 'A-F' 'a-f' < "${ROOT}/sys/class/net/$1/address" 2>/dev/null; }
 probe_cidr() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | head -n1; }
 probe_addr_count() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | wc -l; }
 probe_dns() {  # IPv4 upstream resolvers: resolvectl if present, else resolv.conf minus loopback
@@ -245,8 +248,12 @@ SRC
 }
 
 # ── network (phase 2) ──────────────────────────────────────────────────────────────────────
+# ifupdown2 keeps its lock in /run/network; the cloud image never ran networking.service,
+# so the dir is missing and even `ifup --no-act` dies "Another instance ... running" (#1237)
+ensure_run_network() { mkdir -p "${ROOT}/run/network" || die "cannot create /run/network"; }
+
 write_network() {  # bridge over the uplink; detect from the default route, keep address + gateway
-  local up cidr gw dns k tmp aside
+  local up cidr gw dns k tmp aside mac
   up="$(probe_uplink)"; [[ -n "$up" ]] || die "no default route in phase 2, cannot find the uplink card"
   [[ "$up" == vmbr0 ]] && { log "uplink is already vmbr0; leaving the network file"; return 0; }
   local n; n="$(probe_addr_count "$up")"
@@ -255,21 +262,50 @@ write_network() {  # bridge over the uplink; detect from the default route, keep
   [[ -n "$cidr" && -n "$gw" ]] || die "uplink '${up}' has address '${cidr:-none}' and gateway '${gw:-none}': cannot write vmbr0"
   dns="$(probe_dns)"; [[ -n "$dns" ]] || die "no upstream nameserver found (resolvectl, /etc/resolv.conf): vmbr0 would come up without DNS"
   aside="${STATE_DIR}/network-pre-proxmox"; mkdir -p "$aside" || die "cannot create ${aside}"
+  # the card's name is not stable across the reboot (eth0 -> ens18 seen live): pin it by MAC
+  # to a name of our own and bind the bridge to that (#1237)
+  mac="$(probe_mac "$up")"; [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "cannot read a MAC address for '${up}': found '${mac:-none}'"
   tmp="${ROOT}/etc/network/.interfaces.provisioner.$$"
-  render_interfaces "$up" "$cidr" "$gw" "$dns" > "$tmp" || { rm -f "$tmp"; die "cannot render the interfaces file"; }
   if [[ -z "$ROOT" ]] && command -v ifup >/dev/null 2>&1; then
+    # dry run with the name that exists NOW; the pinned name only exists after the reboot
+    render_interfaces "$up" "$cidr" "$gw" "$dns" > "$tmp" || { rm -f "$tmp"; die "cannot render the interfaces file"; }
+    ensure_run_network
     ifup --no-act -i "$tmp" vmbr0 >>"$LOG_FILE" 2>&1 || { rm -f "$tmp"; die "ifup --no-act rejects the generated vmbr0 file (see ${LOG_FILE})"; }
   fi
+  render_interfaces "$PORT_NAME" "$cidr" "$gw" "$dns" > "$tmp" || { rm -f "$tmp"; die "cannot render the interfaces file"; }
+  mkdir -p "$(dirname "$LINK_FILE")"
+  printf '[Match]\nMACAddress=%s\n\n[Link]\nName=%s\n' "$mac" "$PORT_NAME" > "$LINK_FILE" || die "cannot write ${LINK_FILE}"
   cp -n "${ROOT}/etc/network/interfaces" "${aside}/interfaces" 2>/dev/null
   mv -f "$tmp" "${ROOT}/etc/network/interfaces" || die "cannot replace /etc/network/interfaces"
-  # cloud-init's / netplan's own network files fight the bridge: move them OUT of the
-  # interfaces.d glob (a renamed copy there would still be sourced)
-  for k in "${ROOT}/etc/network/interfaces.d/50-cloud-init" "${ROOT}"/etc/netplan/*.yaml; do
+  # a pending-changes file would be applied over ours by the Proxmox GUI / ifupdown2
+  [[ -e "${ROOT}/etc/network/interfaces.new" ]] && mv -f "${ROOT}/etc/network/interfaces.new" "${aside}/interfaces.new"
+  # cloud-init's / netplan's / networkd's own network files fight the bridge: move them OUT of
+  # the interfaces.d glob (a renamed copy there would still be sourced)
+  mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
+  printf 'network: {config: disabled}\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+  for k in "${ROOT}/etc/network/interfaces.d/50-cloud-init" "${ROOT}"/etc/netplan/*.yaml "${ROOT}"/etc/systemd/network/*.network; do
     [[ -e "$k" ]] && mv -f "$k" "${aside}/$(basename "$k")"
   done
   if [[ -z "$ROOT" ]]; then   # best effort, no --now: the reboot applies it, a live stop could cut us off
     systemctl disable systemd-networkd systemd-networkd.socket systemd-networkd-wait-online >>"$LOG_FILE" 2>&1 || true
+    systemctl enable networking >>"$LOG_FILE" 2>&1 || warn "could not enable networking.service (#1237): vmbr0 may not come up on reboot"
   fi
+  verify_network "$cidr" "$gw" "$mac"
+}
+
+# Last word before the reboot: the file we will boot into must carry vmbr0 with the address and
+# gateway, bound to a port the .link file names for this MAC (#1237). Re-reads from disk.
+verify_network() {  # <cidr> <gateway> <mac>
+  local f="${ROOT}/etc/network/interfaces" st
+  st="$(sed -n '/^iface vmbr0 inet static/,/^$/p' "$f" 2>/dev/null)"
+  [[ -n "$st" ]] || die "BOOT FILE CHECK: ${f} has no vmbr0 stanza: will not reboot into a box with no network"
+  grep -q "^auto vmbr0" "$f" || die "BOOT FILE CHECK: vmbr0 is not set to come up (no 'auto vmbr0')"
+  grep -qxF "$(printf '\taddress %s' "$1")" <<<"$st" || die "BOOT FILE CHECK: vmbr0 lacks address $1"
+  grep -qxF -e "$(printf '\tgateway %s' "$2")" -e "$(printf '\tpost-up ip route add default via %s dev vmbr0' "$2")" <<<"$st" \
+    || die "BOOT FILE CHECK: vmbr0 lacks gateway $2"
+  grep -q "^[[:space:]]*bridge-ports ${PORT_NAME}\$" <<<"$st" || die "BOOT FILE CHECK: vmbr0 bridge-ports is not ${PORT_NAME}"
+  { grep -q "^MACAddress=$3\$" "$LINK_FILE" && grep -q "^Name=${PORT_NAME}\$" "$LINK_FILE"; } 2>/dev/null \
+    || die "BOOT FILE CHECK: ${LINK_FILE} does not give MAC $3 the name ${PORT_NAME}: the port would not exist after reboot"
 }
 
 # ── phase 2 ────────────────────────────────────────────────────────────────────────────────
