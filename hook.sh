@@ -582,8 +582,17 @@ _helper_crypt_sftp_stanza() {
   printf 'set_modtime = false\ndisable_hashcheck = true\n'
   return 0
 }
+_helper_crypt_base() {   # rc 1 = a base that cannot be trusted (a '..' segment, a newline or a CR)
+  local b="${HELPER_PRESENCE_BASE-${REMOTE_DIR-${PROVISIONER_REMOTE_DIR-}}}"
+  case "$b" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  while :; do case "$b" in /*) b="${b#/}" ;; ./*) b="${b#./}" ;; *) break ;; esac; done
+  case "$b" in .) b="" ;; esac
+  case "/${b}/" in */../*) return 1 ;; esac
+  printf '%s' "${b%/}"
+}
 _helper_crypt_remote_stanza() {   # <obscured password> [<obscured salt>]
-  printf '[prov-crypt]\ntype = crypt\nremote = prov-sftp:\nfilename_encryption = standard\ndirectory_name_encryption = true\npassword = %s\n' "$1"
+  local b; b="$(_helper_crypt_base)" || return 1
+  printf '[prov-crypt]\ntype = crypt\nremote = prov-sftp:%s\nfilename_encryption = standard\ndirectory_name_encryption = true\npassword = %s\n' "$b" "$1"
   [ -z "${2:-}" ] || printf 'password2 = %s\n' "$2"
 }
 _helper_crypt_looks_encrypted() {
@@ -591,14 +600,19 @@ _helper_crypt_looks_encrypted() {
   grep -qxE '(scripts|secrets|images|state|restic|version|version-built|downloads)/?' <<<"$t" && return 1
   grep -qE '^[0-9a-v]{26,}/?$' <<<"$t"
 }
-_helper_crypt_alias_stanza() { printf '[prov-crypt]\ntype = alias\nremote = prov-sftp:\n'; }
+_helper_crypt_alias_stanza() { local b; b="$(_helper_crypt_base)" || return 1; printf '[prov-crypt]\ntype = alias\nremote = prov-sftp:%s\n' "$b"; }
 _helper_crypt_local() { case "$1" in /*|./*) printf '%s' "$1" ;; *) printf './%s' "$1" ;; esac; }
 _helper_crypt_p() {
   local p="$1"
   while :; do case "$p" in /*) p="${p#/}" ;; ./*) p="${p#./}" ;; *) break ;; esac; done
   case "$p" in .) p="" ;; esac
   case "/${p}/" in */../*) return 1 ;; esac
-  printf 'prov-crypt:%s' "${p%/}"
+  p="${p%/}"
+  local b; b="$(_helper_crypt_base)" || return 1
+  if [ -n "$b" ] && [ -n "$p" ]; then   # #1228: spelled relative to the estate folder (empty = its root); a path outside it is refused
+    case "$p" in "$b") p="" ;; "$b"/*) p="${p#"$b"/}" ;; *) return 1 ;; esac
+  fi
+  printf 'prov-crypt:%s' "$p"
 }
 
 _crypt_hostspec() { case "${2-}" in ""|22) printf '%s\n' "$1" ;; *) printf '[%s]:%s\n' "$1" "$2" ;; esac; }
@@ -705,7 +719,7 @@ hook_crypt_on() { hook_crypt on; }
 hook_access_path_only() { hook_crypt_on && ! hook_crypt keyed; }
 hook_crypt_get() {
   HELPER="$helper" PROVISIONER_HELPER_PORT="$port" PROVISIONER_HELPER_PASS_FILE="$HELPER_PASS_FILE" \
-    PROVISIONER_HELPER_ID="$hook_crypt_key" hook_crypt get "$@"
+    PROVISIONER_REMOTE_DIR="${HOOK_CRYPT_RD-${_RD}}" PROVISIONER_HELPER_ID="$hook_crypt_key" hook_crypt get "$@"
 }
 hook_crypt_key=""
 hook_crypt_pick_key() {
@@ -730,7 +744,7 @@ hook_crypt_probe() {   # <workdir> <cand0> <cand1>
   local w="$1" i rc worst=0 c
   for i in 0 1; do
     c="${2}"; (( i )) && c="${3}"
-    hook_crypt_fetch_one "${c:+${c}/}scripts/helper-lib.sh" "${w}/c${i}"; rc=$?
+    HOOK_CRYPT_RD="$c" hook_crypt_fetch_one "${c:+${c}/}scripts/helper-lib.sh" "${w}/c${i}"; rc=$?
     case "$rc" in
       0) ;;
       3) printf 'remote open("%s"): No such file or directory\n' "$c" ;;
