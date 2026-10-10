@@ -297,7 +297,45 @@ write_network() {  # bridge over the uplink; detect from the default route, keep
     systemctl disable systemd-networkd systemd-networkd.socket systemd-networkd-wait-online >>"$LOG_FILE" 2>&1 || true
     systemctl enable networking >>"$LOG_FILE" 2>&1 || warn "could not enable networking.service (#1237): vmbr0 may not come up on reboot"
   fi
+  write_resolv "$dns"
   verify_network "$cidr" "$gw" "$mac"
+}
+
+# ifupdown2's dns-nameservers needs resolvconf, which is absent, and networkd is off, so
+# systemd-resolved would have no upstream: stub-only DNS, nothing resolves (#1237). Proxmox
+# manages a plain /etc/resolv.conf: write it from the upstreams probed BEFORE this point.
+write_resolv() {  # <dns, space separated>
+  local f="${ROOT}/etc/resolv.conf" dom="" n tmp
+  [[ -n "${DEBIAN_TO_PVE_HOSTNAME:-}" ]] && dom="${DEBIAN_TO_PVE_HOSTNAME#*.}"
+  tmp="${f}.provisioner.$$"
+  { [[ -n "$dom" ]] && printf 'search %s\n' "$dom"; for n in $1; do printf 'nameserver %s\n' "$n"; done; } > "$tmp" \
+    || { rm -f "$tmp"; die "cannot write ${tmp}"; }
+  chmod 0644 "$tmp"; rm -f "$f"; mv -f "$tmp" "$f" || die "cannot replace /etc/resolv.conf"
+  if [[ -z "$ROOT" ]]; then   # best effort: with no upstream it only shadows the plain file
+    systemctl disable --now systemd-resolved >>"$LOG_FILE" 2>&1 || true
+    systemctl mask systemd-resolved >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+# proxmox-ve ships the enterprise sources enabled; with no subscription they 401 and every
+# apt-get update fails (#1237). Move them aside (deb822 or legacy), keep our no-subscription one.
+disable_enterprise_sources() {
+  local d="${ROOT}/etc/apt/sources.list.d" aside="${STATE_DIR}/apt-pre-enterprise" k
+  mkdir -p "$aside" || die "cannot create ${aside}"
+  for k in "$d"/*.sources "$d"/*.list; do
+    [[ -f "$k" ]] && grep -q 'enterprise\.proxmox\.com' "$k" && { mv -f "$k" "${aside}/$(basename "$k")" || die "cannot move ${k} aside"; log "enterprise source moved aside: $(basename "$k")"; }
+  done
+  [[ -f "${ROOT}/etc/apt/sources.list" ]] && sed -i '/enterprise\.proxmox\.com/s/^[^#]/#&/' "${ROOT}/etc/apt/sources.list"
+  return 0
+}
+
+# apt must be clean before the reboot (#1237): no enterprise source left, update exits 0.
+verify_apt() {
+  local k
+  for k in "${ROOT}"/etc/apt/sources.list.d/*.sources "${ROOT}"/etc/apt/sources.list.d/*.list "${ROOT}/etc/apt/sources.list"; do
+    [[ -f "$k" ]] && grep -v '^[[:space:]]*#' "$k" | grep -q 'enterprise\.proxmox\.com' && die "APT CHECK: ${k} still names enterprise.proxmox.com"
+  done
+  apt_q update || die "APT CHECK: apt-get update fails after the enterprise sources were disabled (see ${LOG_FILE})"
 }
 
 # Last word before the reboot: the file we will boot into must carry vmbr0 with the address and
@@ -313,6 +351,10 @@ verify_network() {  # <cidr> <gateway> <mac>
   grep -q "^[[:space:]]*bridge-ports ${PORT_NAME}\$" <<<"$st" || die "BOOT FILE CHECK: vmbr0 bridge-ports is not ${PORT_NAME}"
   { grep -q "^MACAddress=$3\$" "$LINK_FILE" && grep -q "^Name=${PORT_NAME}\$" "$LINK_FILE"; } 2>/dev/null \
     || die "BOOT FILE CHECK: ${LINK_FILE} does not give MAC $3 the name ${PORT_NAME}: the port would not exist after reboot"
+  local r="${ROOT}/etc/resolv.conf"   # (#1237) a symlink to the resolved stub, or loopback only, means no DNS
+  [[ ! -L "$r" ]] || die "BOOT FILE CHECK: /etc/resolv.conf is still a symlink: the box would boot with no upstream DNS"
+  grep -E '^nameserver[[:space:]]+[0-9]' "$r" 2>/dev/null | grep -qvE '^nameserver[[:space:]]+127\.' \
+    || die "BOOT FILE CHECK: /etc/resolv.conf has no non-loopback nameserver: the box would boot with no DNS"
 }
 
 # ── phase 2 ────────────────────────────────────────────────────────────────────────────────
@@ -331,11 +373,13 @@ phase2() {
     apt_q update || die "apt-get update failed (see ${LOG_FILE})"
     apt_q install proxmox-ve postfix open-iscsi chrony || die "installing proxmox-ve postfix open-iscsi chrony failed (see ${LOG_FILE})"
   fi
+  disable_enterprise_sources
   # the Debian kernel and os-prober (os-prober adds the other kernel to grub for nothing)
   apt_q remove linux-image-amd64 'linux-image-6.*' os-prober || warn "removing the Debian kernel / os-prober returned non-zero"
   real update-grub >>"$LOG_FILE" 2>&1 || die "update-grub failed (see ${LOG_FILE})"
 
   write_network || exit $?
+  verify_apt
 
   command -v pveversion >/dev/null 2>&1 || die "pveversion is not on PATH after installing proxmox-ve"
   log "$(pveversion 2>&1)"
