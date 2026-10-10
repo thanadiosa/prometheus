@@ -943,6 +943,11 @@ hook_crypt_folder_looks_encrypted() {   # <candidate dir> <login root listing to
   done
   return 0
 }
+hook_crypt_folder_is_plain() {   # <candidate dir> <candidate dir> ("" = login root)
+  local out
+  out="$(hook_probe_transport <<<"ls -1 ${1:+${1}/}scripts"$'\n'"ls -1 ${2:+${2}/}scripts")" || return 1
+  grep -Eq '^(.*/)?helper-lib\.sh$' <<<"$out"
+}
 hook_probe_remote_dir() {   # <estate> — sets _RD, RD_SRC and the derived paths, or returns/dies
   local est="${1:-}" work out rc cmds="" i nf missing=0 cand
   local -a cands=("${HELPER_DEFAULT_SSH_RD}/${est}" "") verdict=()
@@ -1006,6 +1011,9 @@ Nothing has been fetched or changed. Fix the cause, or name the directory: re-ru
     [[ -n $keep ]] && hook_probe_have_lib=1
     return 0
   done
+  if hook_crypt keyed && hook_crypt_folder_is_plain "${cands[0]}" "${cands[1]}"; then
+    die "this estate's folder on the helper is not encrypted, but this host holds an encryption key (${HELPER_CRYPT_KEY}). Either remove that key to use the folder as it is, or move the folder to the encrypted layout first (bin/helper-crypt-move.sh, issue #1078). Nothing was written to the helper (issue #1246)."
+  fi
   if ! hook_crypt keyed && hook_crypt_folder_looks_encrypted "${cands[0]}"; then
     die "this estate's boot scripts are not on the helper, and the folder holds only names this estate does not use. That is how an encrypted folder looks, but it can also be a folder that was never staged. This host has no encryption key. If the folder is encrypted: set PROVISIONER_HELPER_CRYPT_KEY_FILE to the key file, or run again from a terminal and choose 't' (first remove ${HELPER_CRYPT_NONE} if it exists, or you will not be asked, issue #1076). If it is not encrypted: stage the boot scripts there (issue #313). Nothing was written to the helper."
   fi
