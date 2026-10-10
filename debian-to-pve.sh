@@ -135,7 +135,7 @@ ConditionPathExists=${SELF_DST#"$ROOT"}
 Type=oneshot
 RemainAfterExit=no
 ExecStart=${SELF_DST#"$ROOT"}
-TimeoutStartSec=0
+TimeoutStartSec=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -157,7 +157,14 @@ disarm_resume() {
   return 0
 }
 
-do_reboot() { log "rebooting ($1)"; [[ -n "$ROOT" ]] || sync; [[ -n "$ROOT" ]] && return 0; systemctl reboot; sleep 60; }
+# Reboot from a transient timer, detached from this process and from the resume unit (#1237): a
+# `systemctl reboot` inside the unit's own start job was lost live (the start timeout killed the
+# unit and the box stayed up). The timer is its own unit, so it survives ours stopping.
+do_reboot() {
+  log "rebooting ($1)"; [[ -n "$ROOT" ]] || sync; [[ -n "$ROOT" ]] && return 0
+  systemd-run --no-block --on-active=10s --timer-property=AccuracySec=1s /bin/systemctl reboot \
+    || die "could not schedule the reboot (systemd-run failed); reboot by hand"
+}
 
 real() { if [[ -n "$ROOT" ]]; then log "probe root: skipping $1"; return 0; fi; "$@"; }   # fake-root guard
 apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }; DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
