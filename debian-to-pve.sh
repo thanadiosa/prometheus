@@ -159,6 +159,37 @@ do_reboot() { log "rebooting ($1)"; [[ -n "$ROOT" ]] || sync; [[ -n "$ROOT" ]] &
 real() { if [[ -n "$ROOT" ]]; then log "probe root: skipping $1"; return 0; fi; "$@"; }   # fake-root guard
 apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }; DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
 
+# -- grub-pc preseed (#1237) --------------------------------------------------------------
+# Proxmox's grub-pc replaces the cloud image's grub-cloud-amd64 and its postinst fails with an
+# empty install_devices. Preseed the disk holding /boot before any apt step that can pull it in.
+probe_boot_disk() {  # parent disk of the filesystem holding /boot (or /), by-id path if one exists
+  local src par dev l
+  src="$(findmnt -no SOURCE --target /boot 2>/dev/null | head -n1)"
+  [[ -n "$src" ]] || return 1
+  par="$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1)"
+  dev="/dev/${par:-${src#/dev/}}"
+  for l in /dev/disk/by-id/*; do
+    [[ "$l" == *-part* || ! -e "$l" ]] && continue
+    [[ "$(readlink -f "$l")" == "$(readlink -f "$dev")" ]] && { printf '%s' "$l"; return 0; }
+  done
+  printf '%s' "$dev"
+}
+render_grub_preseed() {  # <disk>
+  printf 'grub-pc grub-pc/install_devices multiselect %s\ngrub-pc grub-pc/install_devices_empty boolean false\ngrub-pc grub-pc/install_devices_failed boolean false\n' "$1"
+}
+preseed_grub() {
+  if [[ -e "${ROOT}/sys/firmware/efi" ]]; then log "EFI boot: no grub-pc preseed needed"; return 0; fi
+  local d; d="$(probe_boot_disk)" || { warn "cannot find the disk holding /boot; grub-pc preseed skipped"; return 0; }
+  [[ -n "$d" ]] || { warn "empty boot disk; grub-pc preseed skipped"; return 0; }
+  log "grub-pc install device: ${d}"
+  render_grub_preseed "$d" | real debconf-set-selections || die "debconf preseed for grub-pc failed"
+}
+heal_dpkg() {  # a cut or failed run leaves half-configured packages: finish them before apt
+  [[ -n "$ROOT" ]] && { log "probe root: skipping dpkg --configure -a"; return 0; }
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold --force-confdef >>"$LOG_FILE" 2>&1 \
+    || die "dpkg --configure -a failed (see ${LOG_FILE})"
+}
+
 # ── phase 1 ────────────────────────────────────────────────────────────────────────────────
 phase1() {
   local host addr up
@@ -205,6 +236,8 @@ SRC
   printf 'phase2\n' > "$STATE_PHASE"   # armed BEFORE the long steps: a cut mid-apt resumes here
 
   [[ -z "$ROOT" ]] || { log "probe root: stopping before apt"; return 0; }
+  preseed_grub
+  heal_dpkg
   apt_q update || die "apt-get update failed (see ${LOG_FILE})"
   apt_q full-upgrade || die "apt-get full-upgrade failed (see ${LOG_FILE})"
   apt_q install proxmox-default-kernel || die "installing proxmox-default-kernel failed (see ${LOG_FILE})"
@@ -247,6 +280,8 @@ phase2() {
   host="$DEBIAN_TO_PVE_HOSTNAME"; addr="$DEBIAN_TO_PVE_ADDRESS"
   log "phase 2: kernel $(probe_running_kernel)"
 
+  preseed_grub
+  heal_dpkg
   if ! probe_pkg_installed proxmox-ve; then
     printf 'postfix postfix/main_mailer_type select Local only\npostfix postfix/mailname string %s\n' "$host" | real debconf-set-selections \
       || die "debconf preseed for postfix failed"
