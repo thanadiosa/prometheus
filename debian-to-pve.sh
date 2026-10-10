@@ -150,10 +150,12 @@ arm_resume() {
   [[ -n "$ROOT" ]] && return 0
   systemctl daemon-reload && systemctl enable "$UNIT" >/dev/null 2>&1 || die "systemctl refused to enable ${UNIT}"
 }
+# No daemon-reload after the rm (#1237): we usually run INSIDE this unit's start job, and a reload
+# that finds its file gone drops TimeoutStartSec=infinity, times the job out and kills us before
+# the reboot is scheduled (seen live 10-10). The reboot that follows forgets the unit anyway.
 disarm_resume() {
   [[ -z "$ROOT" ]] && { systemctl disable "$UNIT" >/dev/null 2>&1 || warn "could not disable ${UNIT}"; }
   rm -f "$UNIT_FILE" "$SELF_DST"
-  [[ -z "$ROOT" ]] && systemctl daemon-reload
   return 0
 }
 
