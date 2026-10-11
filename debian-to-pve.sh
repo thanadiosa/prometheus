@@ -70,6 +70,19 @@ probe_dns() {  # IPv4 upstream resolvers: resolvectl if present, else resolv.con
 }
 probe_web() { curl -ksf -o /dev/null --max-time 5 https://127.0.0.1:8006/; }
 
+# The node name must resolve to the public address, and stay so: a provider's cloud-init with
+# manage_etc_hosts rewrites /etc/hosts to 127.0.1.1 at every boot, and pve-cluster then refuses to
+# start (seen live on the rented box, #1237). So the entry is written, cloud-init is told to leave
+# the name and the file alone, and phase 2 writes it again in case a boot already undid it.
+pin_hosts() {  # <fqdn> <address>
+  local host="$1" addr="$2"
+  sed -i '/^127\.0\.1\.1[[:space:]]/d' "${ROOT}/etc/hosts" 2>/dev/null
+  sed -i "/[[:space:]]${host%%.*}\([[:space:]]\|\$\)/d" "${ROOT}/etc/hosts" 2>/dev/null
+  printf '%s %s %s\n' "$addr" "$host" "${host%%.*}" >> "${ROOT}/etc/hosts"
+  mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
+  printf 'manage_etc_hosts: false\npreserve_hostname: true\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-provisioner-hosts.cfg"
+}
+
 # ── phase 1 assertions (also --check) ──────────────────────────────────────────────────────
 assert_debian13() {
   local id ver codename
@@ -227,9 +240,7 @@ phase1() {
     hostnamectl set-hostname "${host%%.*}" 2>/dev/null \
       || { printf '%s\n' "${host%%.*}" > /etc/hostname && hostname "${host%%.*}"; } || die "cannot set the hostname"
   else printf '%s\n' "${host%%.*}" > "${ROOT}/etc/hostname"; fi
-  sed -i '/^127\.0\.1\.1[[:space:]]/d' "${ROOT}/etc/hosts" 2>/dev/null
-  sed -i "/[[:space:]]${host%%.*}\([[:space:]]\|\$\)/d" "${ROOT}/etc/hosts" 2>/dev/null
-  printf '%s %s %s\n' "$addr" "$host" "${host%%.*}" >> "${ROOT}/etc/hosts"
+  pin_hosts "$host" "$addr"
 
   # cloud-init must not rewrite the network once the card is a bridge (next boot would undo it)
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
@@ -396,6 +407,10 @@ phase2() {
   . "$STATE_ENV" 2>/dev/null || die "phase state ${STATE_ENV} is missing or unreadable"
   host="$DEBIAN_TO_PVE_HOSTNAME"; addr="$DEBIAN_TO_PVE_ADDRESS"
   log "phase 2: kernel $(probe_running_kernel)"
+  pin_hosts "$host" "$addr"
+  if [[ -z "$ROOT" ]] && systemctl is-failed --quiet pve-cluster 2>/dev/null; then   # a boot undid the entry
+    systemctl reset-failed pve-cluster; systemctl restart pve-cluster pveproxy || warn "pve-cluster restart failed"
+  fi
 
   preseed_grub
   heal_dpkg
