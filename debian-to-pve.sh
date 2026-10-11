@@ -174,19 +174,24 @@ apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0;
 # -- grub-pc preseed (#1237) --------------------------------------------------------------
 # Proxmox's grub-pc replaces the cloud image's grub-cloud-amd64 and its postinst fails with an
 # empty install_devices. Preseed the disk holding /boot before any apt step that can pull it in.
-probe_boot_disk() {  # parent disk of the filesystem holding /boot (or /), by-id path if one exists
-  local src par dev l
+probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260), by-id if one exists; comma list
+  local src disks d l out="" hit
   src="$(findmnt -no SOURCE --target /boot 2>/dev/null | head -n1)"
   [[ -n "$src" ]] || return 1
-  par="$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1)"
-  dev="/dev/${par:-${src#/dev/}}"
-  for l in /dev/disk/by-id/*; do
-    [[ "$l" == *-part* || ! -e "$l" ]] && continue
-    [[ "$(readlink -f "$l")" == "$(readlink -f "$dev")" ]] && { printf '%s' "$l"; return 0; }
+  # inverse tree, raw: every ancestor of the source, one "NAME TYPE" per line; keep the whole disks
+  disks="$(lsblk -nrso NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}' | sort -u)"
+  [[ -n "$disks" ]] || disks="${src#/dev/}"
+  for d in $disks; do
+    hit="/dev/$d"
+    for l in /dev/disk/by-id/*; do
+      [[ "$l" == *-part* || ! -e "$l" ]] && continue
+      [[ "$(readlink -f "$l")" == "$(readlink -f "/dev/$d")" ]] && { hit="$l"; break; }
+    done
+    out+="${out:+,}${hit}"
   done
-  printf '%s' "$dev"
+  printf '%s' "$out"
 }
-render_grub_preseed() {  # <disk>
+render_grub_preseed() {  # <disk[,disk...]> (install_devices takes a comma list, #1260)
   printf 'grub-pc grub-pc/install_devices multiselect %s\ngrub-pc grub-pc/install_devices_empty boolean false\ngrub-pc grub-pc/install_devices_failed boolean false\n' "$1"
 }
 preseed_grub() {
