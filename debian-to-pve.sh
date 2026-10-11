@@ -83,6 +83,26 @@ pin_hosts() {  # <fqdn> <address>
   printf 'manage_etc_hosts: false\npreserve_hostname: true\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-provisioner-hosts.cfg"
 }
 
+# root's SSH keys survive Proxmox (#1237): the install points /root/.ssh/authorized_keys at
+# /etc/pve/priv/authorized_keys, which starts empty, so the keys the provider put on the box were
+# lost live (and with them every login). Phase 1 keeps a copy; phase 2 adds back any that is missing.
+save_root_keys() {
+  local f="${ROOT}/root/.ssh/authorized_keys" k="${STATE_DIR}/root-authorized_keys"
+  [[ -s "$f" && ! -s "$k" ]] && cp "$f" "$k" && chmod 0600 "$k"
+  return 0
+}
+restore_root_keys() {
+  local k="${STATE_DIR}/root-authorized_keys" dst="${ROOT}/root/.ssh/authorized_keys" line n=0
+  [[ -s "$k" ]] || return 0
+  [[ -d "${ROOT}/etc/pve/priv" ]] && dst="${ROOT}/etc/pve/priv/authorized_keys"
+  mkdir -p "$(dirname "$dst")"; touch "$dst"
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    grep -qxF -- "$line" "$dst" 2>/dev/null || { printf '%s\n' "$line" >> "$dst"; n=$((n+1)); }
+  done < "$k"
+  log "root SSH keys: ${n} added back to ${dst#"$ROOT"}"
+}
+
 # ── phase 1 assertions (also --check) ──────────────────────────────────────────────────────
 assert_debian13() {
   local id ver codename
@@ -232,6 +252,7 @@ phase1() {
   log "phase 1: ${host} / ${addr} on ${up}"
 
   mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR"
+  save_root_keys
   ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\n' "$host" "$addr" > "$STATE_ENV" )
 
   # name + hosts: Proxmox needs the node name to resolve to the public address, not 127.0.1.1
@@ -432,6 +453,7 @@ phase2() {
   log "$(pveversion 2>&1)"
   local _; for _ in $(seq 1 30); do probe_web && break; sleep 2; done
   probe_web || die "port 8006 does not answer locally after 60 s"
+  restore_root_keys
 
   ensure_storage_cfg
   verify_storage_cfg
