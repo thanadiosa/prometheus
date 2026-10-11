@@ -174,7 +174,7 @@ apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0;
 # -- grub-pc preseed (#1237) --------------------------------------------------------------
 # Proxmox's grub-pc replaces the cloud image's grub-cloud-amd64 and its postinst fails with an
 # empty install_devices. Preseed the disk holding /boot before any apt step that can pull it in.
-probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260), by-id if one exists; comma list
+probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260), by-id if one exists; ", " list
   local src disks d l out="" hit
   src="$(findmnt -no SOURCE --target /boot 2>/dev/null | head -n1)"
   [[ -n "$src" ]] || return 1
@@ -187,11 +187,11 @@ probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260
       [[ "$l" == *-part* || ! -e "$l" ]] && continue
       [[ "$(readlink -f "$l")" == "$(readlink -f "/dev/$d")" ]] && { hit="$l"; break; }
     done
-    out+="${out:+,}${hit}"
+    out+="${out:+, }${hit}"   # ", ": grub-pc's postinst splits on spaces (a bare comma failed live, #1237)
   done
   printf '%s' "$out"
 }
-render_grub_preseed() {  # <disk[,disk...]> (install_devices takes a comma list, #1260)
+render_grub_preseed() {  # <disk[, disk...]> (debconf's multiselect form, #1260)
   printf 'grub-pc grub-pc/install_devices multiselect %s\ngrub-pc grub-pc/install_devices_empty boolean false\ngrub-pc grub-pc/install_devices_failed boolean false\n' "$1"
 }
 preseed_grub() {
