@@ -222,7 +222,10 @@ phase1() {
   ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\n' "$host" "$addr" > "$STATE_ENV" )
 
   # name + hosts: Proxmox needs the node name to resolve to the public address, not 127.0.1.1
-  if [[ -z "$ROOT" ]]; then hostnamectl set-hostname "${host%%.*}" || die "hostnamectl failed"
+  # A minimal Debian has no D-Bus, so hostnamectl cannot work there (#1260): set the name directly.
+  if [[ -z "$ROOT" ]]; then
+    hostnamectl set-hostname "${host%%.*}" 2>/dev/null \
+      || { printf '%s\n' "${host%%.*}" > /etc/hostname && hostname "${host%%.*}"; } || die "cannot set the hostname"
   else printf '%s\n' "${host%%.*}" > "${ROOT}/etc/hostname"; fi
   sed -i '/^127\.0\.1\.1[[:space:]]/d' "${ROOT}/etc/hosts" 2>/dev/null
   sed -i "/[[:space:]]${host%%.*}\([[:space:]]\|\$\)/d" "${ROOT}/etc/hosts" 2>/dev/null
