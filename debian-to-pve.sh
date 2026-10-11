@@ -343,15 +343,16 @@ verify_apt() {
 # A Proxmox ISO install writes /etc/pve/storage.cfg; the apt install serves an implicit `local`
 # in memory and writes nothing, so host-prep abstains and no data disk becomes vmdata (#1237).
 # Write the ISO default for a dir-only root: pvesm first (goes through the cluster fs), else the file.
+# It carries images: the cold start's pre-flight needs a VM-disk storage before host-prep builds vmdata.
 ensure_storage_cfg() {
   local d="${ROOT}/etc/pve" f="${ROOT}/etc/pve/storage.cfg" _
   for _ in $(seq 1 30); do [[ -w "$d" ]] && break; sleep 2; done
   [[ -w "$d" ]] || die "/etc/pve is not writable after 60 s: pve-cluster is not up"
   [[ -e "$f" ]] && return 0
-  real pvesm set local --content iso,vztmpl,backup >>"$LOG_FILE" 2>&1
+  real pvesm set local --content iso,vztmpl,backup,images,rootdir >>"$LOG_FILE" 2>&1
   if [[ ! -e "$f" ]]; then
     warn "pvesm did not write ${f}; writing the ISO default directly"
-    printf 'dir: local\n\tpath /var/lib/vz\n\tcontent iso,vztmpl,backup\n' > "$f" || die "cannot write ${f}"
+    printf 'dir: local\n\tpath /var/lib/vz\n\tcontent iso,vztmpl,backup,images,rootdir\n' > "$f" || die "cannot write ${f}"
   fi
   log "storage.cfg written: dir local, /var/lib/vz"
 }
