@@ -11,6 +11,8 @@
 #   DEBIAN_TO_PVE_KEYRING_SHA256  override of the pinned keyring hash below (tests / rotation)
 #   DEBIAN_TO_PVE_PROBE_DIR a fake root for file probes (tests only); commands come from PATH
 #   --check                 run only the phase-1 assertions and exit (0 ok, 2 refused)
+#   --pin-hosts             re-apply the pinned /etc/hosts entry from the state dir and exit (the
+#                           boot-time unit runs this before pve-cluster, #1283)
 #
 # TWO PHASES, joined by a transient resume unit (the pve-upgrade pattern: an ENABLED oneshot that
 # fires every boot until the script disables it; the phase is derived from the machine, so a
@@ -18,8 +20,12 @@
 #   1  assert Debian 13 + no Proxmox; name + /etc/hosts; cloud-init network off; Proxmox keyring
 #      + no-subscription source; full-upgrade; proxmox-default-kernel; arm resume; reboot.
 #   2  (booted on the pve kernel) proxmox-ve postfix open-iscsi chrony; drop the Debian kernel
-#      and os-prober; vmbr0 over the uplink; verify pveversion + :8006; disarm; marker; reboot
-#      once so the bridge takes effect.
+#      and os-prober; vmbr0 over the uplink; verify pveversion + :8006; root keys outside
+#      /etc/pve; cloud-init off; hosts-pin unit; reboot once so the bridge takes effect. The
+#      resume unit STAYS armed.
+#   3  (post-boot, same resume unit) pve-cluster active, /etc/pve/local, :8006, root's key file:
+#      only then disarm + done marker (#1283). On failure: diagnostics to the log, armed for
+#      one more boot.
 # A box that comes up wrong has nothing on it: reinstall from the panel and run again.
 set -uo pipefail
 
@@ -33,6 +39,11 @@ STATE_DIR="${ROOT}/var/lib/provisioner/debian-to-pve"
 STATE_ENV="${STATE_DIR}/env"
 STATE_PHASE="${STATE_DIR}/phase"
 DONE_MARK="${STATE_DIR}/done"
+HOSTS_PIN="${STATE_DIR}/hosts-pin"   # "<address> <fqdn>", re-applied at every boot (#1283)
+PIN_DST="${ROOT}/usr/local/sbin/provisioner-pin-hosts"
+PIN_UNIT="provisioner-pin-hosts.service"
+PIN_UNIT_FILE="${ROOT}/etc/systemd/system/${PIN_UNIT}"
+SSHD_DROPIN="${ROOT}/etc/ssh/sshd_config.d/10-provisioner-root-keys.conf"
 LOG_FILE="${ROOT}/var/log/provisioner-debian-to-pve.log"
 KEYRING="${ROOT}/usr/share/keyrings/proxmox-archive-keyring.gpg"
 KEYRING_URL="https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg"
@@ -69,6 +80,7 @@ probe_dns() {  # IPv4 upstream resolvers: resolvectl if present, else resolv.con
   printf '%s\n' "$d" | grep -vE '^127\.' | awk 'NF && !s[$0]++' | tr '\n' ' ' | sed 's/ $//'
 }
 probe_web() { curl -ksf -o /dev/null --max-time 5 https://127.0.0.1:8006/; }
+probe_cluster_active() { systemctl is-active --quiet pve-cluster; }
 
 # The node name must resolve to the public address, and stay so: a provider's cloud-init with
 # manage_etc_hosts rewrites /etc/hosts to 127.0.1.1 at every boot, and pve-cluster then refuses to
@@ -101,6 +113,52 @@ restore_root_keys() {
     grep -qxF -- "$line" "$dst" 2>/dev/null || { printf '%s\n' "$line" >> "$dst"; n=$((n+1)); }
   done < "$k"
   log "root SSH keys: ${n} added back to ${dst#"$ROOT"}"
+}
+
+# A second copy of root's keys OUTSIDE /etc/pve (#1283): with pmxcfs down, /root/.ssh/authorized_keys
+# dangles and root is locked out (seen live 10-12). sshd reads authorized_keys2 as well, but only
+# because we say so in an explicit drop-in (it wins: first value of a keyword is kept).
+keep_root_keys_outside_pve() {
+  local k="${STATE_DIR}/root-authorized_keys" d="${ROOT}/root/.ssh"
+  [[ -s "$k" ]] || { warn "no saved root keys: authorized_keys2 not written (#1283)"; return 0; }
+  mkdir -p "$d" && chmod 0700 "$d"
+  ( umask 077; cat "$k" > "${d}/authorized_keys2" ) || die "cannot write ${d}/authorized_keys2"
+  mkdir -p "$(dirname "$SSHD_DROPIN")"
+  printf '# provisioner debian-to-pve (#1283): root stays reachable if /etc/pve is empty\nAuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2\n' > "$SSHD_DROPIN" \
+    || die "cannot write ${SSHD_DROPIN}"
+  if ! real sshd -t >>"$LOG_FILE" 2>&1; then rm -f "$SSHD_DROPIN"; warn "sshd -t rejects the drop-in; removed it"; return 0; fi
+  real systemctl reload ssh >>"$LOG_FILE" 2>&1 || warn "could not reload sshd"
+  log "root SSH keys: also in /root/.ssh/authorized_keys2, sshd drop-in written"
+}
+
+# The hosts entry is re-applied at EVERY boot, before pmxcfs starts (#1283): the one-time pin was
+# undone by a boot-time rewrite and pve-cluster then never came up. The unit runs a copy of this
+# script (--pin-hosts) so it survives disarm_resume removing the resume copy.
+render_pin_unit() {
+  cat <<PUNIT
+# ${PIN_UNIT} (#1283): put the node name back on its public address before pve-cluster starts.
+[Unit]
+Description=provisioner: pin the node name in /etc/hosts
+DefaultDependencies=no
+After=local-fs.target cloud-init.service
+Before=pve-cluster.service
+ConditionPathExists=${HOSTS_PIN#"$ROOT"}
+
+[Service]
+Type=oneshot
+ExecStart=${PIN_DST#"$ROOT"} --pin-hosts
+
+[Install]
+WantedBy=multi-user.target pve-cluster.service
+PUNIT
+}
+install_pin_unit() {  # <fqdn> <address>
+  printf '%s %s\n' "$2" "$1" > "$HOSTS_PIN" || die "cannot write ${HOSTS_PIN}"
+  mkdir -p "$(dirname "$PIN_DST")" "$(dirname "$PIN_UNIT_FILE")"
+  install -m 0755 "$SCRIPT_PATH" "$PIN_DST" || die "cannot install ${PIN_DST}"
+  render_pin_unit > "$PIN_UNIT_FILE" || die "cannot write ${PIN_UNIT_FILE}"
+  [[ -n "$ROOT" ]] && return 0
+  systemctl daemon-reload && systemctl enable "$PIN_UNIT" >>"$LOG_FILE" 2>&1 || die "systemctl refused to enable ${PIN_UNIT}"
 }
 
 # ── phase 1 assertions (also --check) ──────────────────────────────────────────────────────
@@ -454,31 +512,83 @@ phase2() {
   local _; for _ in $(seq 1 30); do probe_web && break; sleep 2; done
   probe_web || die "port 8006 does not answer locally after 60 s"
   restore_root_keys
+  keep_root_keys_outside_pve
 
   ensure_storage_cfg
   verify_storage_cfg
 
+  install_pin_unit "$host" "$addr"
+  # a hypervisor's network is ours: no cloud-init at boot, so nothing rewrites hosts/hostname (#1283)
+  mkdir -p "${ROOT}/etc/cloud" && : > "${ROOT}/etc/cloud/cloud-init.disabled" || die "cannot write cloud-init.disabled"
+
+  # NOT done yet (#1283): the resume unit stays armed and proves this restart first
+  printf 'verify\n' > "$STATE_PHASE"
+  log "phase 2 finished on ${host}; rebooting once so vmbr0 takes effect, then the post-boot check decides DONE"
+  do_reboot "bridge takes effect"
+}
+
+# ── phase 3: the restart is proven before DONE (#1283) ─────────────────────────────────────
+post_boot_failures() {  # prints what is wrong, one phrase per line; empty = all good
+  probe_cluster_active || echo "pve-cluster is not active"
+  [[ -e "${ROOT}/etc/pve/local" ]] || echo "/etc/pve/local is missing"
+  probe_web || echo "the web port 8006 is silent"
+  [[ -s "${ROOT}/root/.ssh/authorized_keys" ]] || echo "root's authorized_keys is empty or dangling"
+}
+post_boot_diagnostics() {  # what the next person needs to read, in the 0600 conversion log
+  {
+    echo "--- journalctl -b -u pve-cluster -n 80"; journalctl -b -u pve-cluster -n 80 --no-pager 2>&1
+    echo "--- /etc/hosts"; cat "${ROOT}/etc/hosts" 2>&1
+    echo "--- hostname -f"; hostname -f 2>&1
+    echo "--- getent hosts \$(hostname)"; getent hosts "$(hostname)" 2>&1
+  } >>"$LOG_FILE" 2>&1
+}
+post_boot() {
+  local host _ bad cf="${STATE_DIR}/verify-attempts" tries=0
+  # shellcheck disable=SC1090
+  . "$STATE_ENV" 2>/dev/null; host="${DEBIAN_TO_PVE_HOSTNAME:-?}"
+  log "post-boot check on kernel $(probe_running_kernel)"
+  for _ in $(seq 1 30); do bad="$(post_boot_failures)"; [[ -z "$bad" ]] && break; sleep 2; done
+  if [[ -n "$bad" ]]; then   # heal an empty key file from the saved copy once pmxcfs is up, then look again
+    probe_cluster_active && [[ -e "${ROOT}/etc/pve/local" ]] && restore_root_keys && bad="$(post_boot_failures)"
+  fi
+  if [[ -n "$bad" ]]; then
+    warn "post-boot check failed: $(tr '\n' ';' <<<"$bad")"
+    post_boot_diagnostics
+    [[ -s "$cf" ]] && tries="$(cat "$cf")"; tries=$((tries+1)); echo "$tries" > "$cf"
+    if (( tries >= 2 )); then
+      disarm_resume
+      local reach="root has NO key outside /etc/pve: use the provider's rescue system"
+      [[ -s ${ROOT}/root/.ssh/authorized_keys2 && -e $SSHD_DROPIN ]] && reach="root is reachable by authorized_keys2"
+      die "post-boot check failed twice; resume disarmed, no done marker (diagnostics in ${LOG_FILE}); ${reach}"
+    fi
+    DIE_RC=1 die "post-boot check failed; resume left armed for one more boot (diagnostics in ${LOG_FILE})"
+  fi
   disarm_resume
   : > "$DONE_MARK"
-  log "DONE: Proxmox VE is installed on ${host}; rebooting once so vmbr0 takes effect, then run the console one-liner"
-  do_reboot "bridge takes effect"
+  log "DONE: Proxmox VE is installed and survived its restart on ${host}; run the console one-liner"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────────────────
 main() {
-  local check=0
+  local check=0 pin=0
   while (($#)); do case "$1" in
     --hostname) DEBIAN_TO_PVE_HOSTNAME="$2"; shift 2;;
     --address)  DEBIAN_TO_PVE_ADDRESS="$2"; shift 2;;
     --check)    check=1; shift;;
+    --pin-hosts) pin=1; shift;;
     *) die "unknown argument '$1'";;
   esac; done
   [[ -n "$ROOT" || $EUID -eq 0 ]] || die "must run as root: found uid $EUID"
 
+  if ((pin)); then   # boot-time unit (#1283): before pve-cluster, with or without the done marker
+    local pa ph; read -r pa ph < "$HOSTS_PIN" 2>/dev/null; [[ -n "${pa:-}" && -n "${ph:-}" ]] || die "no pinned hosts entry in ${HOSTS_PIN}"
+    pin_hosts "$ph" "$pa"; log "hosts pinned at boot: ${ph}"; exit 0
+  fi
   [[ -e "$DONE_MARK" ]] && { log "already converted (${DONE_MARK}); nothing to do"; exit 0; }
   assert_debian13
   if [[ -s "$STATE_PHASE" ]]; then   # we started: resume, whatever half-installed state we are in
     ((check)) && { log "check: phase state present, would resume"; exit 0; }
+    [[ "$(cat "$STATE_PHASE")" == verify ]] && { post_boot; exit $?; }
     case "$(probe_running_kernel)" in
       *-pve) phase2;;
       *) local tries=0 cf="${STATE_DIR}/attempts"
