@@ -13,6 +13,7 @@
 #   --check                 run only the phase-1 assertions and exit (0 ok, 2 refused)
 #   --pin-hosts             re-apply the pinned /etc/hosts entry from the state dir and exit (the
 #                           boot-time unit runs this before pve-cluster, #1283)
+#   --status                print DONE (exit 0) or the phase + attempt counters (exit 1)
 #
 # TWO PHASES, joined by a transient resume unit (the pve-upgrade pattern: an ENABLED oneshot that
 # fires every boot until the script disables it; the phase is derived from the machine, so a
@@ -24,8 +25,8 @@
 #      /etc/pve; cloud-init off; hosts-pin unit; reboot once so the bridge takes effect. The
 #      resume unit STAYS armed.
 #   3  (post-boot, same resume unit) pve-cluster active, /etc/pve/local, :8006, root's key file:
-#      only then disarm + done marker (#1283). On failure: diagnostics to the log, armed for
-#      one more boot.
+#      only then disarm + done marker (#1283). On failure: heal once (re-pin, restart), then
+#      diagnostics to the log and ONE automatic restart; after a second failure the box stays up.
 # A box that comes up wrong has nothing on it: reinstall from the panel and run again.
 set -uo pipefail
 
@@ -44,6 +45,9 @@ PIN_DST="${ROOT}/usr/local/sbin/provisioner-pin-hosts"
 PIN_UNIT="provisioner-pin-hosts.service"
 PIN_UNIT_FILE="${ROOT}/etc/systemd/system/${PIN_UNIT}"
 SSHD_DROPIN="${ROOT}/etc/ssh/sshd_config.d/10-provisioner-root-keys.conf"
+KEYS_OK="${STATE_DIR}/root-keys-verified"   # written only after sshd -T proved authorized_keys2 is read (#1283)
+CI_HOSTS_CFG="${ROOT}/etc/cloud/cloud.cfg.d/zz-provisioner-hosts.cfg"   # zz-: sorts after any provider 99_x file (#1283)
+CI_NET_CFG="${ROOT}/etc/cloud/cloud.cfg.d/zz-provisioner-disable-network-config.cfg"
 LOG_FILE="${ROOT}/var/log/provisioner-debian-to-pve.log"
 KEYRING="${ROOT}/usr/share/keyrings/proxmox-archive-keyring.gpg"
 KEYRING_URL="https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg"
@@ -81,6 +85,12 @@ probe_dns() {  # IPv4 upstream resolvers: resolvectl if present, else resolv.con
 }
 probe_web() { curl -ksf -o /dev/null --max-time 5 https://127.0.0.1:8006/; }
 probe_cluster_active() { systemctl is-active --quiet pve-cluster; }
+# Is pmxcfs mounted on /etc/pve? A bare directory is writable for root and proves nothing (#1283).
+# Fake root: true, unless a test asks for the real check against the fake path.
+pve_mounted() {
+  [[ -n "$ROOT" && -z "${DEBIAN_TO_PVE_TEST_REAL_CHECKS:-}" ]] && return 0
+  mountpoint -q "${ROOT}/etc/pve"
+}
 
 # The node name must resolve to the public address, and stay so: a provider's cloud-init with
 # manage_etc_hosts rewrites /etc/hosts to 127.0.1.1 at every boot, and pve-cluster then refuses to
@@ -92,7 +102,7 @@ pin_hosts() {  # <fqdn> <address>
   sed -i "/[[:space:]]${host%%.*}\([[:space:]]\|\$\)/d" "${ROOT}/etc/hosts" 2>/dev/null
   printf '%s %s %s\n' "$addr" "$host" "${host%%.*}" >> "${ROOT}/etc/hosts"
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
-  printf 'manage_etc_hosts: false\npreserve_hostname: true\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-provisioner-hosts.cfg"
+  printf 'manage_etc_hosts: false\npreserve_hostname: true\n' > "$CI_HOSTS_CFG"
 }
 
 # root's SSH keys survive Proxmox (#1237): the install points /root/.ssh/authorized_keys at
@@ -100,12 +110,17 @@ pin_hosts() {  # <fqdn> <address>
 # lost live (and with them every login). Phase 1 keeps a copy; phase 2 adds back any that is missing.
 save_root_keys() {
   local f="${ROOT}/root/.ssh/authorized_keys" k="${STATE_DIR}/root-authorized_keys"
-  [[ -s "$f" && ! -s "$k" ]] && cp "$f" "$k" && chmod 0600 "$k"
+  # only usable keys: cloud-init's disabled-root stub (command="...") is non-empty but opens nothing (#1283)
+  [[ -s "$f" && ! -s "$k" ]] || return 0
+  ( umask 077; grep -vE '^[[:space:]]*(#|$)|(^|[ ,])command=' "$f" > "$k" ) 2>/dev/null
+  [[ -s "$k" ]] || rm -f "$k"
   return 0
 }
 restore_root_keys() {
   local k="${STATE_DIR}/root-authorized_keys" dst="${ROOT}/root/.ssh/authorized_keys" line n=0
   [[ -s "$k" ]] || return 0
+  # a write under an UNMOUNTED /etc/pve would block the mount later (#1283): rely on authorized_keys2
+  pve_mounted || { warn "pmxcfs is not mounted on /etc/pve: keys not restored there; authorized_keys2 carries them (#1283)"; return 0; }
   [[ -d "${ROOT}/etc/pve/priv" ]] && dst="${ROOT}/etc/pve/priv/authorized_keys"
   mkdir -p "$(dirname "$dst")"; touch "$dst"
   while IFS= read -r line; do
@@ -126,9 +141,21 @@ keep_root_keys_outside_pve() {
   mkdir -p "$(dirname "$SSHD_DROPIN")"
   printf '# provisioner debian-to-pve (#1283): root stays reachable if /etc/pve is empty\nAuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2\n' > "$SSHD_DROPIN" \
     || die "cannot write ${SSHD_DROPIN}"
-  if ! real sshd -t >>"$LOG_FILE" 2>&1; then rm -f "$SSHD_DROPIN"; warn "sshd -t rejects the drop-in; removed it"; return 0; fi
+  if ! real sshd -t >>"$LOG_FILE" 2>&1; then rm -f "$SSHD_DROPIN"; warn "sshd -t rejects the drop-in; removed it"; fi
   real systemctl reload ssh >>"$LOG_FILE" 2>&1 || warn "could not reload sshd"
+  assert_sshd_reads_keys2
   log "root SSH keys: also in /root/.ssh/authorized_keys2, sshd drop-in written"
+}
+# We are still reachable here, so a drop-in sshd does not honour is refused, not trusted (#1283).
+assert_sshd_reads_keys2() {
+  [[ -n "$ROOT" && -z "${DEBIAN_TO_PVE_TEST_REAL_CHECKS:-}" ]] && return 0
+  local t; t="$(sshd -T -C user=root,host=x,addr=127.0.0.1 2>>"$LOG_FILE")"
+  log "sshd: $(grep -i '^permitrootlogin' <<<"$t" | head -n1)"
+  grep -qi '^authorizedkeysfile.*authorized_keys2' <<<"$t" \
+    || die "sshd does not read /root/.ssh/authorized_keys2 (sshd -T): an earlier-sorting drop-in probably out-votes ours; see $(ls "${ROOT}"/etc/ssh/sshd_config.d 2>&1 | tr '\n' ' ') in /etc/ssh/sshd_config.d (#1283)"
+  grep -qiE '^permitrootlogin[[:space:]]+(yes|prohibit-pa[s]sword|without-pa[s]sword)[[:space:]]*$' <<<"$t" \
+    || die "sshd does not let root in by key (permitrootlogin: $(grep -i '^permitrootlogin' <<<"$t" | head -n1)): authorized_keys2 would not help (#1283)"
+  : > "$KEYS_OK"
 }
 
 # The hosts entry is re-applied at EVERY boot, before pmxcfs starts (#1283): the one-time pin was
@@ -159,6 +186,28 @@ install_pin_unit() {  # <fqdn> <address>
   render_pin_unit > "$PIN_UNIT_FILE" || die "cannot write ${PIN_UNIT_FILE}"
   [[ -n "$ROOT" ]] && return 0
   systemctl daemon-reload && systemctl enable "$PIN_UNIT" >>"$LOG_FILE" 2>&1 || die "systemctl refused to enable ${PIN_UNIT}"
+}
+
+# `hostname` may be missing on a minimal image: fall back to /proc and uname (#1283).
+cur_hostname() { if command -v hostname >/dev/null 2>&1; then hostname; else cat /proc/sys/kernel/hostname 2>/dev/null || uname -n; fi; }
+set_running_hostname() {
+  if command -v hostname >/dev/null 2>&1; then hostname "$1"; else printf '%s\n' "$1" > /proc/sys/kernel/hostname; fi
+}
+# Name and address, in the files and in the running kernel (pmxcfs reads gethostname(), #1283).
+apply_name() {  # <fqdn> <address>
+  pin_hosts "$1" "$2"
+  printf '%s\n' "${1%%.*}" > "${ROOT}/etc/hostname"
+  real set_running_hostname "${1%%.*}"
+}
+# Dies while the box is still up if the name would not survive the restart (#1283).
+verify_name() {  # <fqdn> <address>
+  local fq="$1" ad="$2" sh="${1%%.*}" h
+  for h in "$fq" "$sh"; do
+    [[ "$(getent hosts "$h" 2>/dev/null | awk '{print $1; exit}')" == "$ad" ]] || die "NAME CHECK: '${h}' does not resolve to ${ad}: pve-cluster would not start"
+  done
+  [[ "$(cur_hostname)" == "$sh" ]] || die "NAME CHECK: the running hostname is '$(cur_hostname)', expected '${sh}'"
+  [[ "$(cat "${ROOT}/etc/hostname" 2>/dev/null)" == "$sh" ]] || die "NAME CHECK: /etc/hostname is not '${sh}'"
+  ! grep -q '^127\.0\.1\.1[[:space:]]' "${ROOT}/etc/hosts" || die "NAME CHECK: /etc/hosts still has a 127.0.1.1 line"
 }
 
 # ── phase 1 assertions (also --check) ──────────────────────────────────────────────────────
@@ -218,7 +267,7 @@ render_unit() {
 # ENABLED, fires every boot until the script disables it; the phase is derived from the machine.
 [Unit]
 Description=provisioner Debian to Proxmox conversion (resume)
-After=network-online.target
+After=network-online.target pve-cluster.service pveproxy.service
 Wants=network-online.target
 ConditionPathExists=${SELF_DST#"$ROOT"}
 
@@ -260,7 +309,7 @@ do_reboot() {
 }
 
 real() { if [[ -n "$ROOT" ]]; then log "probe root: skipping $1"; return 0; fi; "$@"; }   # fake-root guard
-apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }; DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
+apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }; DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
 
 # -- grub-pc preseed (#1237) --------------------------------------------------------------
 # Proxmox's grub-pc replaces the cloud image's grub-cloud-amd64 and its postinst fails with an
@@ -292,42 +341,103 @@ preseed_grub() {
   log "grub-pc install device: ${d}"
   render_grub_preseed "$d" | real debconf-set-selections || die "debconf preseed for grub-pc failed"
 }
+# Background apt must not hold the dpkg lock under us (#1283; cf. quiesce_apt in the pve-upgrade unit).
+quiesce_apt() {
+  local u
+  log "quiesce apt: timers and unattended-upgrades off"
+  for u in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+    real systemctl disable --now "$u" >>"$LOG_FILE" 2>&1 || true
+  done
+}
 heal_dpkg() {  # a cut or failed run leaves half-configured packages: finish them before apt
   [[ -n "$ROOT" ]] && { log "probe root: skipping dpkg --configure -a"; return 0; }
   DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold --force-confdef >>"$LOG_FILE" 2>&1 \
     || die "dpkg --configure -a failed (see ${LOG_FILE})"
 }
 
+# Prove the box can boot before each reboot (#1283): the pve kernel's initramfs must carry the md
+# driver when / or /boot sit on an array, mdadm.conf must name it, grub must offer the kernel.
+verify_bootable() {
+  local kv img lst md=0
+  kv="$(ls -1 "${ROOT}"/boot/vmlinuz-*-pve 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1)"
+  [[ -n "$kv" ]] || die "BOOT CHECK: no Proxmox kernel (vmlinuz-*-pve) in /boot: will not reboot"
+  grep -q '^md[0-9]' "${ROOT}/proc/mdstat" 2>/dev/null && md=1
+  if ((md)); then
+    img="${ROOT}/boot/initrd.img-${kv}"
+    [[ -e "$img" ]] || die "BOOT CHECK: ${img#"$ROOT"} is missing"
+    # listing to a file first: `lsinitramfs | grep -q` fails under pipefail once grep quits early (seen live)
+    lst="$(mktemp)" || die "mktemp failed"
+    lsinitramfs "$img" >"$lst" 2>/dev/null
+    grep -Eq 'mdadm|raid1|md_mod' "$lst" \
+      || { rm -f "$lst"; die "BOOT CHECK: the initramfs of ${kv} has no mdadm/raid driver but / sits on an md array: it would not boot"; }
+    grep -q '^ARRAY' "${ROOT}/etc/mdadm/mdadm.conf" 2>/dev/null \
+      || warn "BOOT CHECK: /etc/mdadm/mdadm.conf has no ARRAY line (initramfs carries etc/mdadm/mdadm.conf: $(grep -c 'etc/mdadm/mdadm.conf' "$lst")); the initramfs hook normally generates it"
+    rm -f "$lst"
+  fi
+  grep -q 'vmlinuz-.*-pve' "${ROOT}/boot/grub/grub.cfg" 2>/dev/null \
+    || die "BOOT CHECK: /boot/grub/grub.cfg does not mention the Proxmox kernel (vmlinuz-*-pve)"
+  log "boot check ok: ${kv}$( ((md)) && echo ', md array in initramfs + mdadm.conf')"
+}
+# Facts for a freeze we may not be able to read afterwards (#1283): into the 0600 log.
+box_facts() {
+  local f
+  {
+    for f in proc/mdstat proc/cmdline etc/fstab etc/default/grub; do echo "--- /$f"; cat "${ROOT}/$f" 2>&1; done
+    echo "--- /etc/default/grub.d/*"; cat "${ROOT}"/etc/default/grub.d/* 2>&1
+    echo "--- cloud-init hosts/hostname settings"
+    grep -rn 'manage_etc_hosts\|preserve_hostname' "${ROOT}/etc/cloud" "${ROOT}/var/lib/cloud/instance" 2>/dev/null
+    echo "--- ls udev rules, interfaces.d"; ls -la "${ROOT}/etc/udev/rules.d" "${ROOT}/etc/network/interfaces.d" 2>&1
+    if [[ -z "$ROOT" ]]; then
+      echo "--- lsblk -f"; lsblk -f 2>&1
+      echo "--- mdadm --detail --scan"; mdadm --detail --scan 2>&1
+      echo "--- scw/cloud units"; systemctl list-unit-files 2>&1 | grep -iE 'scw|scaleway|cloud'
+    fi
+  } >>"$LOG_FILE" 2>&1
+  return 0
+}
+
 # ── phase 1 ────────────────────────────────────────────────────────────────────────────────
 phase1() {
   local host addr up
   host="${DEBIAN_TO_PVE_HOSTNAME:-}"; addr="${DEBIAN_TO_PVE_ADDRESS:-}"
-  [[ "$host" == *.* && "$host" =~ ^[A-Za-z0-9.-]+$ ]] || die "DEBIAN_TO_PVE_HOSTNAME must be an FQDN of letters, digits, dots, dashes: found '${host:-unset}'"
+  [[ "$host" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+$ ]] \
+    || die "DEBIAN_TO_PVE_HOSTNAME must be a lowercase FQDN of letters, digits, dots, dashes, not starting with a dash or dot (Proxmox node names are lowercase): found '${host:-unset}'"
   up="$(probe_uplink)"; [[ -n "$up" ]] || die "no default route, so no uplink card found"
   [[ -n "$addr" ]] || addr="$(probe_cidr "$up")"
   addr="${addr%%/*}"; [[ -n "$addr" ]] || die "no address given and none on uplink '${up}'"
   [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "address is not a dotted IPv4: found '${addr}'"
   log "phase 1: ${host} / ${addr} on ${up}"
+  quiesce_apt
+  box_facts
+  # fail now what phase 2 would fail on after the upgrade (#1283)
+  [[ "$up" == vmbr0 ]] || preflight_uplink "$up"
 
   mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR"
   save_root_keys
-  ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\n' "$host" "$addr" > "$STATE_ENV" )
+  if [[ ! -s "${STATE_DIR}/root-authorized_keys" && "${DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY:-}" != 1 ]]; then
+    die "no usable key in /root/.ssh/authorized_keys (blank, comments and command= lines do not count): root would have no way in after Proxmox replaces that file (#1283); add one, or set DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=1 to go on anyway"
+  fi
+  keep_root_keys_outside_pve
+  mkdir -p "${ROOT}/var/log/journal"; real systemd-tmpfiles --create --prefix /var/log/journal >>"$LOG_FILE" 2>&1 || true   # a freeze leaves a readable journal
+  ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\n' "$host" "$addr" > "$STATE_ENV"
+    [[ -z "${DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY:-}" ]] || printf 'DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=%q\n' "$DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY" >> "$STATE_ENV" )
 
   # name + hosts: Proxmox needs the node name to resolve to the public address, not 127.0.1.1
   # A minimal Debian has no D-Bus, so hostnamectl cannot work there (#1260): set the name directly.
   if [[ -z "$ROOT" ]]; then
     hostnamectl set-hostname "${host%%.*}" 2>/dev/null \
-      || { printf '%s\n' "${host%%.*}" > /etc/hostname && hostname "${host%%.*}"; } || die "cannot set the hostname"
+      || { printf '%s\n' "${host%%.*}" > /etc/hostname && set_running_hostname "${host%%.*}"; } || die "cannot set the hostname"
   else printf '%s\n' "${host%%.*}" > "${ROOT}/etc/hostname"; fi
   pin_hosts "$host" "$addr"
 
   # cloud-init must not rewrite the network once the card is a bridge (next boot would undo it)
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
-  printf 'network: {config: disabled}\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+  printf 'network: {config: disabled}\n' > "$CI_NET_CFG"
 
   # keyring, pinned
   [[ -n "$KEYRING_SHA256" ]] || die "the Proxmox keyring hash is not pinned in this script (KEYRING_SHA256 empty): refusing to trust an unverified download"
   local tmp; tmp="$(mktemp)" || die "mktemp failed"
+  command -v curl >/dev/null 2>&1 || { rm -f "$tmp"; die "curl is missing: cannot download ${KEYRING_URL}"; }
   curl -fsSL --retry 3 -o "$tmp" "$KEYRING_URL" || { rm -f "$tmp"; die "cannot download ${KEYRING_URL}"; }
   local got; got="$(sha256sum "$tmp" | cut -d' ' -f1)"
   [[ "$got" == "$KEYRING_SHA256" ]] || { rm -f "$tmp"; die "keyring sha256 mismatch: found ${got}, pinned ${KEYRING_SHA256}"; }
@@ -351,6 +461,7 @@ SRC
   apt_q update || die "apt-get update failed (see ${LOG_FILE})"
   apt_q full-upgrade || die "apt-get full-upgrade failed (see ${LOG_FILE})"
   apt_q install proxmox-default-kernel || die "installing proxmox-default-kernel failed (see ${LOG_FILE})"
+  verify_bootable
   do_reboot "into the Proxmox kernel"
 }
 
@@ -359,19 +470,26 @@ SRC
 # so the dir is missing and even `ifup --no-act` dies "Another instance ... running" (#1237)
 ensure_run_network() { mkdir -p "${ROOT}/run/network" || die "cannot create /run/network"; }
 
+# Everything write_network will need, checked up front: phase 1 runs it too, so a box that
+# phase 2 would refuse is refused before the 30-minute upgrade (#1283). Sets PF_*.
+preflight_uplink() {  # <uplink>
+  local up="$1" n
+  n="$(probe_addr_count "$up")"
+  (( n == 1 )) || die "uplink '${up}' has ${n} global IPv4 addresses, expected exactly 1: will not guess which one vmbr0 keeps"
+  PF_CIDR="$(probe_cidr "$up")"; PF_GW="$(probe_gateway)"
+  [[ -n "$PF_CIDR" && -n "$PF_GW" ]] || die "uplink '${up}' has address '${PF_CIDR:-none}' and gateway '${PF_GW:-none}': cannot write vmbr0"
+  PF_DNS="$(probe_dns)"; [[ -n "$PF_DNS" ]] || die "no upstream nameserver found (resolvectl, /etc/resolv.conf): vmbr0 would come up without DNS"
+  # the card's name is not stable across the reboot (eth0 -> ens18 seen live): pin it by MAC
+  # to a name of our own and bind the bridge to that (#1237)
+  PF_MAC="$(probe_mac "$up")"; [[ "$PF_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "cannot read a MAC address for '${up}': found '${PF_MAC:-none}'"
+}
+
 write_network() {  # bridge over the uplink; detect from the default route, keep address + gateway
   local up cidr gw dns k tmp aside mac
   up="$(probe_uplink)"; [[ -n "$up" ]] || die "no default route in phase 2, cannot find the uplink card"
   [[ "$up" == vmbr0 ]] && { log "uplink is already vmbr0; leaving the network file"; return 0; }
-  local n; n="$(probe_addr_count "$up")"
-  (( n == 1 )) || die "uplink '${up}' has ${n} global IPv4 addresses, expected exactly 1: will not guess which one vmbr0 keeps"
-  cidr="$(probe_cidr "$up")"; gw="$(probe_gateway)"
-  [[ -n "$cidr" && -n "$gw" ]] || die "uplink '${up}' has address '${cidr:-none}' and gateway '${gw:-none}': cannot write vmbr0"
-  dns="$(probe_dns)"; [[ -n "$dns" ]] || die "no upstream nameserver found (resolvectl, /etc/resolv.conf): vmbr0 would come up without DNS"
+  preflight_uplink "$up"; cidr="$PF_CIDR"; gw="$PF_GW"; dns="$PF_DNS"; mac="$PF_MAC"
   aside="${STATE_DIR}/network-pre-proxmox"; mkdir -p "$aside" || die "cannot create ${aside}"
-  # the card's name is not stable across the reboot (eth0 -> ens18 seen live): pin it by MAC
-  # to a name of our own and bind the bridge to that (#1237)
-  mac="$(probe_mac "$up")"; [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "cannot read a MAC address for '${up}': found '${mac:-none}'"
   tmp="${ROOT}/etc/network/.interfaces.provisioner.$$"
   if [[ -z "$ROOT" ]] && command -v ifup >/dev/null 2>&1; then
     # dry run with the name that exists NOW; the pinned name only exists after the reboot
@@ -381,7 +499,7 @@ write_network() {  # bridge over the uplink; detect from the default route, keep
   fi
   render_interfaces "$PORT_NAME" "$cidr" "$gw" "$dns" > "$tmp" || { rm -f "$tmp"; die "cannot render the interfaces file"; }
   mkdir -p "$(dirname "$LINK_FILE")"
-  printf '[Match]\nMACAddress=%s\n\n[Link]\nName=%s\n' "$mac" "$PORT_NAME" > "$LINK_FILE" || die "cannot write ${LINK_FILE}"
+  printf '[Match]\nMACAddress=%s\nType=ether\n\n[Link]\nName=%s\n' "$mac" "$PORT_NAME" > "$LINK_FILE" || die "cannot write ${LINK_FILE}"
   cp -n "${ROOT}/etc/network/interfaces" "${aside}/interfaces" 2>/dev/null
   mv -f "$tmp" "${ROOT}/etc/network/interfaces" || die "cannot replace /etc/network/interfaces"
   # a pending-changes file would be applied over ours by the Proxmox GUI / ifupdown2
@@ -389,9 +507,18 @@ write_network() {  # bridge over the uplink; detect from the default route, keep
   # cloud-init's / netplan's / networkd's own network files fight the bridge: move them OUT of
   # the interfaces.d glob (a renamed copy there would still be sourced)
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
-  printf 'network: {config: disabled}\n' > "${ROOT}/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
-  for k in "${ROOT}/etc/network/interfaces.d/50-cloud-init" "${ROOT}"/etc/netplan/*.yaml "${ROOT}"/etc/systemd/network/*.network; do
-    [[ -e "$k" ]] && mv -f "$k" "${aside}/$(basename "$k")"
+  printf 'network: {config: disabled}\n' > "$CI_NET_CFG"
+  # Every interfaces.d file goes, and any udev rule naming our MAC (it could pre-empt the rename);
+  # the .link above matches Type=ether so vmbr0, which has the same MAC, is not renamed (#1283).
+  for k in "${ROOT}"/etc/network/interfaces.d/* "${ROOT}"/etc/netplan/*.yaml "${ROOT}"/etc/systemd/network/*.network; do
+    [[ -f "$k" || -L "$k" ]] && mv -f "$k" "${aside}/$(basename "$k")"
+  done
+  for k in "${ROOT}"/etc/systemd/network/*.link; do   # a provider .link naming the MAC that sorts before ours would win
+    [[ -f "$k" && "$k" != "$LINK_FILE" && "$(basename "$k")" < "$(basename "$LINK_FILE")" ]] && grep -qi -- "$mac" "$k" \
+      && { mv -f "$k" "${aside}/$(basename "$k")" && log "link file naming the uplink MAC moved aside: $(basename "$k")"; }
+  done
+  for k in "${ROOT}"/etc/udev/rules.d/*.rules; do
+    [[ -f "$k" ]] && grep -qi -- "$mac" "$k" && { mv -f "$k" "${aside}/$(basename "$k")" && log "udev rule naming the uplink MAC moved aside: $(basename "$k")"; }
   done
   if [[ -z "$ROOT" ]]; then   # best effort, no --now: the reboot applies it, a live stop could cut us off
     systemctl disable systemd-networkd systemd-networkd.socket systemd-networkd-wait-online >>"$LOG_FILE" 2>&1 || true
@@ -444,8 +571,8 @@ verify_apt() {
 # It carries images: the cold start's pre-flight needs a VM-disk storage before host-prep builds vmdata.
 ensure_storage_cfg() {
   local d="${ROOT}/etc/pve" f="${ROOT}/etc/pve/storage.cfg" _
-  for _ in $(seq 1 30); do [[ -w "$d" ]] && break; sleep 2; done
-  [[ -w "$d" ]] || die "/etc/pve is not writable after 60 s: pve-cluster is not up"
+  for _ in $(seq 1 30); do pve_mounted && [[ -w "$d" ]] && break; sleep 2; done
+  pve_mounted && [[ -w "$d" ]] || die "/etc/pve is not mounted and writable after 60 s: pve-cluster is not up"
   [[ -e "$f" ]] && return 0
   real pvesm set local --content iso,vztmpl,backup,images,rootdir >>"$LOG_FILE" 2>&1
   if [[ ! -e "$f" ]]; then
@@ -486,6 +613,7 @@ phase2() {
   . "$STATE_ENV" 2>/dev/null || die "phase state ${STATE_ENV} is missing or unreadable"
   host="$DEBIAN_TO_PVE_HOSTNAME"; addr="$DEBIAN_TO_PVE_ADDRESS"
   log "phase 2: kernel $(probe_running_kernel)"
+  quiesce_apt
   pin_hosts "$host" "$addr"
   if [[ -z "$ROOT" ]] && systemctl is-failed --quiet pve-cluster 2>/dev/null; then   # a boot undid the entry
     systemctl reset-failed pve-cluster; systemctl restart pve-cluster pveproxy || warn "pve-cluster restart failed"
@@ -499,9 +627,12 @@ phase2() {
     apt_q update || die "apt-get update failed (see ${LOG_FILE})"
     apt_q install proxmox-ve postfix open-iscsi chrony || die "installing proxmox-ve postfix open-iscsi chrony failed (see ${LOG_FILE})"
   fi
+  # root's way in first, before any step below can die (#1283)
+  restore_root_keys
+  keep_root_keys_outside_pve
   disable_enterprise_sources
   # the Debian kernel and os-prober (os-prober adds the other kernel to grub for nothing)
-  apt_q remove linux-image-amd64 'linux-image-6.*' os-prober || warn "removing the Debian kernel / os-prober returned non-zero"
+  apt_q remove linux-image-amd64 linux-image-cloud-amd64 'linux-image-6.*' os-prober || warn "removing the Debian kernel / os-prober returned non-zero"
   real update-grub >>"$LOG_FILE" 2>&1 || die "update-grub failed (see ${LOG_FILE})"
 
   write_network || exit $?
@@ -520,6 +651,8 @@ phase2() {
   install_pin_unit "$host" "$addr"
   # a hypervisor's network is ours: no cloud-init at boot, so nothing rewrites hosts/hostname (#1283)
   mkdir -p "${ROOT}/etc/cloud" && : > "${ROOT}/etc/cloud/cloud-init.disabled" || die "cannot write cloud-init.disabled"
+  apply_name "$host" "$addr"; verify_name "$host" "$addr"
+  verify_bootable
 
   # NOT done yet (#1283): the resume unit stays armed and proves this restart first
   printf 'verify\n' > "$STATE_PHASE"
@@ -533,58 +666,110 @@ post_boot_failures() {  # prints what is wrong, one phrase per line; empty = all
   [[ -e "${ROOT}/etc/pve/local" ]] || echo "/etc/pve/local is missing"
   probe_web || echo "the web port 8006 is silent"
   [[ -s "${ROOT}/root/.ssh/authorized_keys" ]] || echo "root's authorized_keys is empty or dangling"
+  [[ -e "${ROOT}/sys/class/net/vmbr0/brif/${PORT_NAME}" ]] || echo "vmbr0 has no port ${PORT_NAME}"
+  [[ "$(probe_uplink)" == vmbr0 ]] || echo "the default route is not on vmbr0"
+  [[ -s "${ROOT}/etc/pve/storage.cfg" ]] || echo "/etc/pve/storage.cfg is empty or missing"
 }
 post_boot_diagnostics() {  # what the next person needs to read, in the 0600 conversion log
   {
+    echo "--- journalctl --list-boots"; journalctl --list-boots --no-pager 2>&1
+    echo "--- journalctl -b -1 -p warning -n 150"; journalctl -b -1 -p warning -n 150 --no-pager 2>&1
+    echo "--- journalctl -b -u pve-cluster -u pveproxy -u pvedaemon -n 60"; journalctl -b -u pve-cluster -u pveproxy -u pvedaemon -n 60 --no-pager 2>&1
     echo "--- journalctl -b -u pve-cluster -n 80"; journalctl -b -u pve-cluster -n 80 --no-pager 2>&1
+    echo "--- systemctl --failed"; systemctl --failed --no-pager 2>&1
+    echo "--- systemctl status pve-cluster"; systemctl status pve-cluster --no-pager 2>&1
+    echo "--- /proc/cmdline"; cat "${ROOT}/proc/cmdline" 2>&1
+    echo "--- dmesg | tail -60"; dmesg 2>&1 | tail -60
+    echo "--- mount | grep pve|fuse"; mount 2>&1 | grep -E 'pve|fuse'
+    echo "--- ls -la /etc/pve /var/lib/pve-cluster"; ls -la "${ROOT}/etc/pve" "${ROOT}/var/lib/pve-cluster" 2>&1
+    echo "--- /etc/hostname"; cat "${ROOT}/etc/hostname" 2>&1
     echo "--- /etc/hosts"; cat "${ROOT}/etc/hosts" 2>&1
     echo "--- hostname -f"; hostname -f 2>&1
-    echo "--- getent hosts \$(hostname)"; getent hosts "$(hostname)" 2>&1
+    echo "--- getent hosts \$(hostname)"; getent hosts "$(cur_hostname)" 2>&1
+    echo "--- date -u"; date -u 2>&1
+    echo "--- ip -br a"; ip -br a 2>&1
+    echo "--- ip r"; ip r 2>&1
+    echo "--- /proc/mdstat"; cat "${ROOT}/proc/mdstat" 2>&1
   } >>"$LOG_FILE" 2>&1
 }
+# One round of the check: wait for the services, then heal an empty key file from the saved copy.
+post_boot_round() {  # sets $bad
+  local _
+  for _ in $(seq 1 90); do bad="$(post_boot_failures)"; [[ -z "$bad" ]] && break; sleep 2; done
+  if [[ -n "$bad" ]]; then
+    probe_cluster_active && [[ -e "${ROOT}/etc/pve/local" ]] && restore_root_keys && bad="$(post_boot_failures)"
+  fi
+}
+# A boot-time rewrite of the name is the known cause (#1283): put it back and restart the services.
+post_boot_heal() {
+  local pa="${DEBIAN_TO_PVE_ADDRESS:-}" ph="${DEBIAN_TO_PVE_HOSTNAME:-}"
+  [[ -s "$HOSTS_PIN" ]] && read -r pa ph < "$HOSTS_PIN"
+  if [[ -n "$pa" && -n "$ph" ]]; then apply_name "$ph" "$pa"; else warn "no name/address to re-pin"; fi
+  systemctl reset-failed pve-cluster pveproxy pvedaemon >>"$LOG_FILE" 2>&1   # not `real`: stubbed in tests
+  systemctl restart pve-cluster pveproxy pvedaemon >>"$LOG_FILE" 2>&1 || warn "restart of the Proxmox services failed"
+}
 post_boot() {
-  local host _ bad cf="${STATE_DIR}/verify-attempts" tries=0
+  local host bad="" cf="${STATE_DIR}/verify-attempts" tries=0
   # shellcheck disable=SC1090
   . "$STATE_ENV" 2>/dev/null; host="${DEBIAN_TO_PVE_HOSTNAME:-?}"
   log "post-boot check on kernel $(probe_running_kernel)"
-  for _ in $(seq 1 30); do bad="$(post_boot_failures)"; [[ -z "$bad" ]] && break; sleep 2; done
-  if [[ -n "$bad" ]]; then   # heal an empty key file from the saved copy once pmxcfs is up, then look again
-    probe_cluster_active && [[ -e "${ROOT}/etc/pve/local" ]] && restore_root_keys && bad="$(post_boot_failures)"
+  if curl -fsI --max-time 10 "$KEYRING_URL" >/dev/null 2>&1; then log "off-box: ${KEYRING_URL%%/debian*} reachable"; else warn "off-box: cannot reach ${KEYRING_URL%%/debian*} (not a failure)"; fi
+  post_boot_round
+  if [[ -n "$bad" ]]; then
+    warn "post-boot check failed: $(tr '\n' ';' <<<"$bad"); healing once"
+    post_boot_heal; post_boot_round
+    [[ -z "$bad" ]] && log "post-boot check passed after the heal: healed by re-pin"
   fi
   if [[ -n "$bad" ]]; then
     warn "post-boot check failed: $(tr '\n' ';' <<<"$bad")"
     post_boot_diagnostics
     [[ -s "$cf" ]] && tries="$(cat "$cf")"; tries=$((tries+1)); echo "$tries" > "$cf"
-    if (( tries >= 2 )); then
-      disarm_resume
-      local reach="root has NO key outside /etc/pve: use the provider's rescue system"
-      [[ -s ${ROOT}/root/.ssh/authorized_keys2 && -e $SSHD_DROPIN ]] && reach="root is reachable by authorized_keys2"
-      die "post-boot check failed twice; resume disarmed, no done marker (diagnostics in ${LOG_FILE}); ${reach}"
+    if (( tries == 1 )); then
+      do_reboot "post-boot retry"
+      DIE_RC=1 die "post-boot check failed; one automatic restart to retry (diagnostics in ${LOG_FILE})"
     fi
-    DIE_RC=1 die "post-boot check failed; resume left armed for one more boot (diagnostics in ${LOG_FILE})"
+    local reach="root has NO verified key outside /etc/pve: use the provider's rescue system"
+    [[ -e $KEYS_OK && -s ${ROOT}/root/.ssh/authorized_keys2 && -e $SSHD_DROPIN ]] && reach="root access configured via authorized_keys2"
+    DIE_RC=1 die "post-boot check failed again: no further automatic restart; the box stays up, ${reach}; the resume unit stays armed; read ${LOG_FILE}"
   fi
   disarm_resume
   : > "$DONE_MARK"
   log "DONE: Proxmox VE is installed and survived its restart on ${host}; run the console one-liner"
 }
 
+# One conversion run at a time: the resume unit and a hand start must not overlap (#1283).
+take_lock() {
+  [[ -n "$ROOT" ]] && return 0
+  mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR"
+  exec 9>"${STATE_DIR}/lock"
+  flock -n 9 || die "another conversion run is active"
+}
+
 # ── dispatch ───────────────────────────────────────────────────────────────────────────────
 main() {
-  local check=0 pin=0
+  local check=0 pin=0 status=0
   while (($#)); do case "$1" in
-    --hostname) DEBIAN_TO_PVE_HOSTNAME="$2"; shift 2;;
-    --address)  DEBIAN_TO_PVE_ADDRESS="$2"; shift 2;;
+    --hostname) [[ $# -ge 2 ]] || die "missing value for --hostname"; DEBIAN_TO_PVE_HOSTNAME="$2"; shift 2;;
+    --address)  [[ $# -ge 2 ]] || die "missing value for --address"; DEBIAN_TO_PVE_ADDRESS="$2"; shift 2;;
+    --status)   status=1; shift;;
     --check)    check=1; shift;;
     --pin-hosts) pin=1; shift;;
     *) die "unknown argument '$1'";;
   esac; done
+  if ((status)); then   # read-only: for the operator and for "done yet?" (#1283)
+    [[ -n "$ROOT" || $EUID -eq 0 ]] || { echo "run as root (the state dir is root-only)"; exit 3; }
+    [[ -e "$DONE_MARK" ]] && { echo DONE; exit 0; }
+    echo "phase=$(cat "$STATE_PHASE" 2>/dev/null || echo none) phase1-reruns=$(cat "${STATE_DIR}/attempts" 2>/dev/null || echo 0) postboot-failures=$(cat "${STATE_DIR}/verify-attempts" 2>/dev/null || echo 0)"
+    exit 1
+  fi
   [[ -n "$ROOT" || $EUID -eq 0 ]] || die "must run as root: found uid $EUID"
 
   if ((pin)); then   # boot-time unit (#1283): before pve-cluster, with or without the done marker
     local pa ph; read -r pa ph < "$HOSTS_PIN" 2>/dev/null; [[ -n "${pa:-}" && -n "${ph:-}" ]] || die "no pinned hosts entry in ${HOSTS_PIN}"
-    pin_hosts "$ph" "$pa"; log "hosts pinned at boot: ${ph}"; exit 0
+    apply_name "$ph" "$pa"; log "hosts pinned at boot: ${ph}"; exit 0
   fi
   [[ -e "$DONE_MARK" ]] && { log "already converted (${DONE_MARK}); nothing to do"; exit 0; }
+  ((check)) || take_lock
   assert_debian13
   if [[ -s "$STATE_PHASE" ]]; then   # we started: resume, whatever half-installed state we are in
     ((check)) && { log "check: phase state present, would resume"; exit 0; }
