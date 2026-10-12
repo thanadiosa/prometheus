@@ -77,9 +77,9 @@ probe_gateway() { ip -o -4 route show default 2>/dev/null | sed -n 's/.* via \([
 probe_mac() { tr 'A-F' 'a-f' < "${ROOT}/sys/class/net/$1/address" 2>/dev/null; }
 probe_cidr() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | head -n1; }
 probe_addr_count() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | wc -l; }
-probe_dns() {  # IPv4 upstream resolvers: resolvectl if present, else resolv.conf minus loopback
+probe_dns() {  # IPv4 upstream resolvers: resolvectl if present (never under a fake root: it answers for the REAL host), else resolv.conf minus loopback
   local d=""
-  command -v resolvectl >/dev/null 2>&1 && d="$(resolvectl dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')"
+  [[ -n "$ROOT" ]] || ! command -v resolvectl >/dev/null 2>&1 || d="$(resolvectl dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')"
   [[ -n "$d" ]] || d="$(sed -n 's/^nameserver[[:space:]]\+\([0-9.]\+\).*/\1/p' "${ROOT}/etc/resolv.conf" 2>/dev/null)"
   printf '%s\n' "$d" | grep -vE '^127\.' | awk 'NF && !s[$0]++' | tr '\n' ' ' | sed 's/ $//'
 }
@@ -221,11 +221,11 @@ assert_debian13() {
     || die "this is not Debian 13 (trixie): found ID='${id:-none}' VERSION_ID='${ver:-none}' VERSION_CODENAME='${codename:-none}'"
 }
 proxmox_found() {  # prints what it found, rc 0 if Proxmox is present
-  local f=() p
-  for p in proxmox-ve pve-manager; do probe_pkg_installed "$p" && f+=("package $p"); done
-  [[ -e "${ROOT}/etc/pve" ]] && f+=("/etc/pve")
-  ((${#f[@]})) || return 1
-  printf '%s' "${f[*]}"
+  local seen=() p   # not "f": other functions use $f as a path string and newer shellcheck tracks the name script-wide (SC2128/SC2178)
+  for p in proxmox-ve pve-manager; do probe_pkg_installed "$p" && seen+=("package $p"); done
+  [[ -e "${ROOT}/etc/pve" ]] && seen+=("/etc/pve")
+  ((${#seen[@]})) || return 1
+  printf '%s' "${seen[*]}"
 }
 assert_no_proxmox() {
   local found; found="$(proxmox_found)" && die "Proxmox is already on this box (found: ${found}) and no phase state from this script exists"
@@ -319,16 +319,16 @@ apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0;
 # empty install_devices. Preseed the disk holding /boot before any apt step that can pull it in.
 probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260), by-id if one exists; ", " list
   local src disks d l out="" hit
-  src="$(findmnt -no SOURCE --target /boot 2>/dev/null | head -n1)"
+  src="$(findmnt -no SOURCE --target "${ROOT}/boot" 2>/dev/null | head -n1)"   # fake root: its own /boot, never the host's
   [[ -n "$src" ]] || return 1
   # inverse tree, raw: every ancestor of the source, one "NAME TYPE" per line; keep the whole disks
   disks="$(lsblk -nrso NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}' | sort -u)"
   [[ -n "$disks" ]] || disks="${src#/dev/}"
   for d in $disks; do
     hit="/dev/$d"
-    for l in /dev/disk/by-id/*; do
+    for l in "${ROOT}"/dev/disk/by-id/*; do   # fake root: its own by-id tree, never the host's
       [[ "$l" == *-part* || ! -e "$l" ]] && continue
-      [[ "$(readlink -f "$l")" == "$(readlink -f "/dev/$d")" ]] && { hit="$l"; break; }
+      [[ "$(readlink -f "$l")" == "$(readlink -f "${ROOT}/dev/$d")" ]] && { hit="${l#"$ROOT"}"; break; }
     done
     out+="${out:+, }${hit}"   # ", ": grub-pc's postinst splits on spaces (a bare comma failed live, #1237)
   done
