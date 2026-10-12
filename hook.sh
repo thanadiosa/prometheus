@@ -441,6 +441,10 @@ for _bin in pveversion qm pvesm; do
     || die "'${_bin}' not found — this does not look like a Proxmox VE host. The bootstrap chain provisions a PVE hypervisor and nothing here will work on anything else. Nothing has been changed."
 done
 unset _bin
+CONV_DIR="${PROVISIONER_CONVERSION_DIR:-/var/lib/provisioner/debian-to-pve}"
+if [[ -e "${CONV_DIR}/phase" && ! -e "${CONV_DIR}/done" ]]; then
+  die "the Debian-to-Proxmox conversion is still running on this box; wait for DONE (/usr/local/sbin/provisioner-pin-hosts --status) and run this again. Nothing has been changed."
+fi
 log "raw-PVE gate OK — PVE $(pveversion 2>/dev/null | sed -n 's|^pve-manager/\([0-9.]*\).*|\1|p' || true), running as root (the FULL pre-flight runs from the checkout, below)"
 
 cm_opts=()
