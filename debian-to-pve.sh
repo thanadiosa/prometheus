@@ -203,7 +203,10 @@ apply_name() {  # <fqdn> <address>
 verify_name() {  # <fqdn> <address>
   local fq="$1" ad="$2" sh="${1%%.*}" h
   for h in "$fq" "$sh"; do
-    [[ "$(getent hosts "$h" 2>/dev/null | awk '{print $1; exit}')" == "$ad" ]] || die "NAME CHECK: '${h}' does not resolve to ${ad}: pve-cluster would not start"
+    # IPv4 answers only, the address anywhere among them: `getent hosts` lists the hostname
+    # module's IPv6 addresses first on a real box and the old first-field read refused it (#1283)
+    getent ahostsv4 "$h" 2>/dev/null | awk -v a="$ad" '$1 == a { f = 1 } END { exit !f }' \
+      || die "NAME CHECK: '${h}' does not resolve to ${ad} (IPv4): pve-cluster would not start"
   done
   [[ "$(cur_hostname)" == "$sh" ]] || die "NAME CHECK: the running hostname is '$(cur_hostname)', expected '${sh}'"
   [[ "$(cat "${ROOT}/etc/hostname" 2>/dev/null)" == "$sh" ]] || die "NAME CHECK: /etc/hostname is not '${sh}'"
