@@ -234,14 +234,53 @@ fi
 
 HELPER_CRYPT_KEY="${STATE_DIR}/helper-crypt-key"
 HELPER_CRYPT_NONE="${STATE_DIR}/helper-crypt-none"
+HELPER_CRYPT_SCHEME_FILE="${STATE_DIR}/helper-crypt-scheme"   # #1250: derived-v1 | stored
 HELPER_ACCESS="${STATE_DIR}/helper-access"   # #1202: the access path without encryption; a line "rclone"
 hook_tty_dev=/dev/tty          # a variable, not an env knob: the tests point it at a pty
 hook_crypt_minted=0; hook_crypt_new_estate=0
-hook_crypt_store() {   # <password> <salt> -> the stored key, atomically, 0600
-  local t="${HELPER_CRYPT_KEY}.new.$$"
-  rm -f "${HELPER_CRYPT_KEY}".new.*   # stale temp files from a killed earlier run
+hook_crypt_store() {   # <password> <salt> [<scheme>] -> marker first, then the key, each atomic, 0600
+  local t="${HELPER_CRYPT_KEY}.new.$$" m="${HELPER_CRYPT_SCHEME_FILE}.new.$$"
+  rm -f "${HELPER_CRYPT_KEY}".new.* "${HELPER_CRYPT_SCHEME_FILE}".new.*   # stale temp files from a killed earlier run
+  ( umask 077; printf '%s\n' "${3:-stored}" > "$m" ) 2>/dev/null && mv -f "$m" "$HELPER_CRYPT_SCHEME_FILE" || { rm -f "$m"; return 1; }
   ( umask 077; printf '%s\n%s\n' "$1" "$2" > "$t" ) && chmod 600 "$t" && mv -f "$t" "$HELPER_CRYPT_KEY" \
-    || { rm -f "$t"; return 1; }
+    || { rm -f "$t" "$HELPER_CRYPT_SCHEME_FILE"; return 1; }
+}
+HOOK_CRYPT_DERIVE_PY='import sys, hashlib, unicodedata
+est = unicodedata.normalize("NFC", sys.argv[1] if len(sys.argv) > 1 else "")
+if not est or any(c in est for c in "|\r\n"):
+    sys.exit(2)
+try:
+    pw = sys.stdin.buffer.read().decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(4)
+pw = unicodedata.normalize("NFC", pw[:-1] if pw.endswith("\n") else pw)
+if not pw:
+    sys.exit(3)
+for lab in ("password", "password2"):
+    print(hashlib.scrypt(pw.encode(), salt=("prometheus-helper-crypt-v1|%s|%s" % (est, lab)).encode(), n=2**17, r=8, p=1, maxmem=2**28, dklen=32).hex())'
+hook_crypt_derive() {   # <estate>; the password on stdin -> two lines on stdout (password, password2)
+  python3 -I -c "$HOOK_CRYPT_DERIVE_PY" "$1"
+}
+HOOK_CRYPT_WEAK_PY='import sys
+try:
+    p = sys.stdin.buffer.read().decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(4)
+w = p.replace("-", " ").split()
+if len(w) >= 6 and all(len(x) >= 3 for x in w) and len({x.lower() for x in w}) >= 6 and sum(len(x) for x in w) >= 20:
+    sys.exit(0)
+c = [any(x.islower() for x in p), any(x.isupper() for x in p), any(x.isdigit() for x in p), any(not x.isalnum() and x not in " -" for x in p)]
+sys.exit(0 if len(p) >= 20 and sum(c) >= 3 and len(set(p)) >= 12 else 1)'
+HOOK_CRYPT_WEAK_MSG="that password is too weak to protect the seedbox folder: it needs six different words of three letters or more, or twenty mixed characters. Use a generated one of about six random words."
+hook_crypt_weak() {   # <password> -> rc 0 strong enough, 1 weak or unreadable; prints nothing about the password
+  printf '%s' "$1" | python3 -I -c "$HOOK_CRYPT_WEAK_PY" 2>/dev/null
+}
+hook_crypt_derive_store() {   # <password> -> derive from it, store as derived-v1; rc 1 = nothing stored
+  local k k1 k2
+  k="$(printf '%s' "$1" | hook_crypt_derive "${estate:-}")" || return 1
+  k1="$(sed -n 1p <<<"$k")"; k2="$(sed -n 2p <<<"$k")"
+  [[ $k1 =~ ^[0-9a-f]{64}$ && $k2 =~ ^[0-9a-f]{64}$ && $k1 != "$k2" ]] || return 1
+  hook_crypt_store "$k1" "$k2" "derived-v1 ${estate}"
 }
 hook_crypt_rand() { head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n'; }
 hook_crypt_from_file() {   # <file> -> copy an operator-supplied key file to the stored path
@@ -252,8 +291,20 @@ hook_crypt_from_file() {   # <file> -> copy an operator-supplied key file to the
   [[ -z $(find "$f" -maxdepth 0 -perm /077 2>/dev/null) ]] || warn "the key file ${f} is readable by others - tighten it (chmod 600) or remove it after this run"
   hook_crypt_store "$pw" "$salt"
 }
+hook_crypt_vault_from_file() {   # <file> -> refuse a weak password, else derive and store (unattended)
+  local f="$1" vp rc
+  [[ -f $f && -r $f ]] || return 1
+  [[ -z $(find "$f" -maxdepth 0 -perm /077 2>/dev/null) ]] || die "PROVISIONER_VAULT_PASS_FILE ${f} is readable by others - chmod 600 it and re-run"
+  [[ -n ${PROVISIONER_ESTATE:-} ]] || die "deriving the seedbox key unattended needs PROVISIONER_ESTATE (the estate name is part of the key)"
+  vp="$(sed -n 1p "$f" | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r\n')"; [[ -n $vp ]] || return 1
+  if ! hook_crypt_weak "$vp"; then unset vp; die "$HOOK_CRYPT_WEAK_MSG"; fi
+  hook_crypt_derive_store "$vp"; rc=$?; unset vp
+  log "the vault password file ${f} was read; remove it when this run is done"
+  return $rc
+}
 hook_crypt_key_interview() {
-  local src="${PROVISIONER_HELPER_CRYPT_KEY_FILE:-}" ans pw pw2 salt n
+  local src="${PROVISIONER_HELPER_CRYPT_KEY_FILE:-}" ans pw pw2 salt n weakdie="" dflt=n scheme="${PROVISIONER_HELPER_CRYPT_SCHEME:-}" vf="${PROVISIONER_VAULT_PASS_FILE:-}"
+  [[ $scheme == stored ]] || dflt=d   # #1250: working the key out from the vault password is the default
   if [[ -s $HELPER_CRYPT_KEY ]]; then
     log "using the seedbox encryption key already stored at ${HELPER_CRYPT_KEY}"
     if [[ -n $src && $src != "$HELPER_CRYPT_KEY" && -s $src ]] && ! cmp -s "$src" "$HELPER_CRYPT_KEY"; then
@@ -268,13 +319,29 @@ hook_crypt_key_interview() {
     log "seedbox reached through the access path without encryption (#1202; remove ${HELPER_ACCESS} to be asked again)"
   elif [[ -e $HELPER_CRYPT_NONE ]]; then
     log "no seedbox encryption (chosen on an earlier run; remove ${HELPER_CRYPT_NONE} to be asked again, or name a key file in PROVISIONER_HELPER_CRYPT_KEY_FILE)"
+  elif [[ $scheme == derived-v1 && -n $vf ]]; then   # #1250: opt-in only (scheme AND file); a none or access setting above always wins
+    hook_crypt_vault_from_file "$vf" || die "PROVISIONER_VAULT_PASS_FILE names ${vf}, which is missing, unreadable, empty or could not be turned into a key"
+    log "the seedbox encryption key was worked out from the vault password and stored at ${HELPER_CRYPT_KEY}"
   elif [[ $have_tty == 1 ]]; then
     for n in 1 2 3; do
-      read -rp "encrypt this estate's seedbox folder (only a new or already-encrypted one; an existing plain folder must be moved first)? n = no (default) / a = no encryption but reach it through the access path (an encrypted folder is refused at first use) / g = generate a key for me / t = type the key I already have: " ans <"$hook_tty_dev"
-      case "${ans:-n}" in
+      read -rp "encrypt this estate's seedbox folder (only a new or already-encrypted one; an existing plain folder must be moved first)? n = no / a = no encryption but reach it through the access path (an encrypted folder is refused at first use) / d = work the key out from the vault password, one secret to remember (default) / g = generate a key for me / t = type the key I already have: " ans <"$hook_tty_dev"
+      case "${ans:-$dflt}" in
         n|N|no) ( umask 077; : > "$HELPER_CRYPT_NONE" ) 2>/dev/null; log "no seedbox encryption chosen"; break ;;
         a|A) ( umask 022; printf 'rclone\n' > "$HELPER_ACCESS" ) || die "could not record the access-path setting at ${HELPER_ACCESS}"
              log "no seedbox encryption; the seedbox is reached through the access path (#1202)"; break ;;
+        d|D)
+          if [[ -z ${PROVISIONER_ESTATE:-} ]]; then
+            read -rp "deriving for estate ${estate} (the name is part of the key). Right? y / n (default y): " ans <"$hook_tty_dev"
+            case "${ans:-y}" in y|Y|yes) ;; *) say "set PROVISIONER_ESTATE to the right estate name and run again, or answer another way"; continue ;; esac
+          else say "deriving for estate ${estate}"; fi
+          IFS= read -rsp "vault password: " pw <"$hook_tty_dev"; printf '\n' >"$hook_tty_dev"
+          if ! hook_crypt_weak "$pw"; then unset pw; weakdie=1; say "$HOOK_CRYPT_WEAK_MSG"; continue; fi
+          weakdie=""
+          IFS= read -rsp "vault password again: " pw2 <"$hook_tty_dev"; printf '\n' >"$hook_tty_dev"
+          if [[ $pw != "$pw2" ]]; then unset pw pw2; say "the two entries did not match, try again"; continue; fi
+          hook_crypt_derive_store "$pw"; salt=$?; unset pw pw2
+          (( salt == 0 )) || die "could not work out and store the key (python3 needed) - nothing was stored"
+          unset salt; log "the seedbox encryption key was worked out from the vault password and stored at ${HELPER_CRYPT_KEY}"; break ;;
         g|G)
           pw="$(hook_crypt_rand)"; salt="$(hook_crypt_rand)"
           [[ ${#pw} -ge 32 && ${#salt} -ge 32 ]] || die "could not read random bytes to make a key - nothing was stored"
@@ -294,12 +361,12 @@ hook_crypt_key_interview() {
           IFS= read -rsp "seedbox key salt (empty for none): " salt <"$hook_tty_dev"; printf '\n' >"$hook_tty_dev"
           hook_crypt_store "$pw" "$salt" || die "could not store the key at ${HELPER_CRYPT_KEY}"
           unset pw pw2 salt; break ;;
-        *) say "answer n, a, g or t" ;;
+        *) say "answer n, a, d, g or t" ;;
       esac
       (( n == 3 )) && die "no usable answer to the encryption question"
     done
     [[ -s $HELPER_CRYPT_KEY || -e $HELPER_CRYPT_NONE || -s $HELPER_ACCESS ]] \
-      || die "no encryption key was stored and 'none' was not chosen - stopping rather than carrying on unencrypted by accident"
+      || die "${weakdie:+$HOOK_CRYPT_WEAK_MSG }no encryption key was stored and 'none' was not chosen - stopping rather than carrying on unencrypted by accident"
   fi
   [[ -s $HELPER_CRYPT_KEY ]] && unset PROVISIONER_HELPER_CRYPT_KEY_FILE
   if [[ -s $HELPER_CRYPT_KEY || -e $HELPER_CRYPT_NONE ]]; then rm -f "$HELPER_ACCESS"; fi   # (an explicit setting already cleared "none")
