@@ -411,6 +411,57 @@ box_facts() {
   return 0
 }
 
+# The box recipe (#1310): the cloud-init user-data this box started from and its disk layout, kept
+# in the state folder BEFORE anything changes (the provider never gives either back). The
+# user-data can carry a hash or a token, so 0600 root. Never fails the conversion; a re-run that
+# finds the files leaves them.
+save_box_recipe() {
+  local ci="${STATE_DIR}/cloud-init.user-data" dl="${STATE_DIR}/disk-layout.json" src="" f
+  if [[ -s $ci ]]; then log "box recipe: cloud-init copy already kept"
+  else
+    for f in "${ROOT}/var/lib/cloud/instance/user-data.txt" $(ls -t "${ROOT}"/var/lib/cloud/instances/*/user-data.txt 2>/dev/null); do
+      [[ -s $f ]] && { src="$f"; break; }
+    done
+    if [[ -n $src ]] && ( umask 077; cp "$src" "$ci" ) 2>/dev/null; then chmod 0600 "$ci"; log "box recipe: kept the cloud-init user-data"
+    else rm -f "$ci"; warn "box recipe: no cloud-init user-data copy found, skipped"; fi
+  fi
+  if [[ -s $dl ]]; then log "box recipe: disk layout already kept"; return 0; fi
+  if ! command -v python3 >/dev/null 2>&1; then warn "box recipe: no python3, disk layout skipped"; return 0; fi
+  ( umask 077; ROOT="$ROOT" python3 - "$dl" <<'PY'
+import json, os, subprocess, sys, datetime
+root = os.environ.get("ROOT", "")
+def run(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return ""
+def rd(p):
+    try:
+        return open(root + p, errors="replace").read()
+    except Exception:
+        return ""
+try:
+    lsblk = json.loads(run("lsblk", "-J", "-o", "NAME,KNAME,TYPE,SIZE,FSTYPE,LABEL,MOUNTPOINT,PARTTYPE,PARTLABEL,PARTUUID,MODEL,SERIAL") or "{}")
+except Exception:
+    lsblk = {}
+sfdisk = {}
+for d in lsblk.get("blockdevices", []):
+    if d.get("type") == "disk":
+        t = run("sfdisk", "-d", "/dev/" + d["name"])
+        if t:
+            sfdisk[d["name"]] = t
+doc = {"lsblk": lsblk, "sfdisk": sfdisk, "mdadm": run("mdadm", "--detail", "--scan"),
+       "mdstat": rd("/proc/mdstat"), "fstab": rd("/etc/fstab"),
+       "taken_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "hostname": run("hostname").strip()}
+with open(sys.argv[1] + ".tmp", "w") as fh:
+    json.dump(doc, fh, indent=1)
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+PY
+  ) 2>>"$LOG_FILE" && log "box recipe: kept the disk layout" || { rm -f "$dl" "$dl.tmp"; warn "box recipe: disk layout could not be written, skipped"; }
+  return 0
+}
+
 # ── phase 1 ────────────────────────────────────────────────────────────────────────────────
 phase1() {
   local host addr up
@@ -429,6 +480,7 @@ phase1() {
   [[ "$up" == vmbr0 ]] || preflight_uplink "$up"
 
   mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR"
+  save_box_recipe   # before anything changes (#1310)
   save_root_keys
   if [[ ! -s "${STATE_DIR}/root-authorized_keys" && "${DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY:-}" != 1 ]]; then
     die "no usable key in /root/.ssh/authorized_keys (blank, comments and command= lines do not count): root would have no way in after Proxmox replaces that file (#1283); add one, or set DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=1 to go on anyway"
