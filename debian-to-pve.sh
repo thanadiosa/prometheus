@@ -12,7 +12,10 @@
 #   DEBIAN_TO_PVE_PROBE_DIR a fake root for file probes (tests only); commands come from PATH
 #   --check                 run only the phase-1 assertions and exit (0 ok, 2 refused)
 #   --pin-hosts             re-apply the pinned /etc/hosts entry from the state dir and exit (the
-#                           boot-time unit runs this before pve-cluster, #1283)
+#                           boot-time unit runs this before pve-cluster, #1283); skipped when the pinned
+#                           address is no longer in /etc/network/interfaces (box moved, #1289)
+#   --repin <fqdn> [addr]   rewrite the pin file (node rename; address defaults to the old one, #1289)
+#                           (a pin from an explicit --address is never skipped as stale: it may be NAT'd)
 #   --status                print DONE (exit 0) or the phase + attempt counters (exit 1)
 #
 # TWO PHASES, joined by a transient resume unit (the pve-upgrade pattern: an ENABLED oneshot that
@@ -180,12 +183,21 @@ WantedBy=multi-user.target pve-cluster.service
 PUNIT
 }
 install_pin_unit() {  # <fqdn> <address>
-  printf '%s %s\n' "$2" "$1" > "$HOSTS_PIN" || die "cannot write ${HOSTS_PIN}"
+  # third field = where the address came from; only a probed one may go stale on a move (#1289)
+  printf '%s %s %s\n' "$2" "$1" "${DEBIAN_TO_PVE_ADDRESS_SRC:-probe}" > "$HOSTS_PIN" || die "cannot write ${HOSTS_PIN}"
   mkdir -p "$(dirname "$PIN_DST")" "$(dirname "$PIN_UNIT_FILE")"
   install -m 0755 "$SCRIPT_PATH" "$PIN_DST" || die "cannot install ${PIN_DST}"
   render_pin_unit > "$PIN_UNIT_FILE" || die "cannot write ${PIN_UNIT_FILE}"
   [[ -n "$ROOT" ]] && return 0
   systemctl daemon-reload && systemctl enable "$PIN_UNIT" >>"$LOG_FILE" 2>&1 || die "systemctl refused to enable ${PIN_UNIT}"
+}
+
+# Static `address` lines in /etc/network/interfaces (+ interfaces.d): none = DHCP/unknown, so the pin is
+# honoured (#1289). Files named by `source-directory` elsewhere are not read; the conversion writes none.
+pin_address_current() {  # <address>
+  local lines
+  lines="$(cat "${ROOT}/etc/network/interfaces" "${ROOT}"/etc/network/interfaces.d/* 2>/dev/null | awk '$1 == "address" { sub("/.*", "", $2); print $2 }')"
+  [[ -z "$lines" ]] || grep -qxF "$1" <<<"$lines"
 }
 
 # `hostname` may be missing on a minimal image: fall back to /proc and uname (#1283).
@@ -403,6 +415,7 @@ box_facts() {
 phase1() {
   local host addr up
   host="${DEBIAN_TO_PVE_HOSTNAME:-}"; addr="${DEBIAN_TO_PVE_ADDRESS:-}"
+  local src=override; [[ -n "$addr" ]] || src=probe   # an explicit address may be NAT'd, not on the NIC (#1289)
   [[ "$host" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+$ ]] \
     || die "DEBIAN_TO_PVE_HOSTNAME must be a lowercase FQDN of letters, digits, dots, dashes, not starting with a dash or dot (Proxmox node names are lowercase): found '${host:-unset}'"
   up="$(probe_uplink)"; [[ -n "$up" ]] || die "no default route, so no uplink card found"
@@ -422,7 +435,7 @@ phase1() {
   fi
   keep_root_keys_outside_pve
   mkdir -p "${ROOT}/var/log/journal"; real systemd-tmpfiles --create --prefix /var/log/journal >>"$LOG_FILE" 2>&1 || true   # a freeze leaves a readable journal
-  ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\n' "$host" "$addr" > "$STATE_ENV"
+  ( umask 077; printf 'DEBIAN_TO_PVE_HOSTNAME=%q\nDEBIAN_TO_PVE_ADDRESS=%q\nDEBIAN_TO_PVE_ADDRESS_SRC=%q\n' "$host" "$addr" "$src" > "$STATE_ENV"
     [[ -z "${DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY:-}" ]] || printf 'DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=%q\n' "$DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY" >> "$STATE_ENV" )
 
   # name + hosts: Proxmox needs the node name to resolve to the public address, not 127.0.1.1
@@ -750,13 +763,15 @@ take_lock() {
 
 # ── dispatch ───────────────────────────────────────────────────────────────────────────────
 main() {
-  local check=0 pin=0 status=0
+  local check=0 pin=0 status=0 repin_fq='' repin_ad=''
   while (($#)); do case "$1" in
     --hostname) [[ $# -ge 2 ]] || die "missing value for --hostname"; DEBIAN_TO_PVE_HOSTNAME="$2"; shift 2;;
     --address)  [[ $# -ge 2 ]] || die "missing value for --address"; DEBIAN_TO_PVE_ADDRESS="$2"; shift 2;;
     --status)   status=1; shift;;
     --check)    check=1; shift;;
     --pin-hosts) pin=1; shift;;
+    --repin)    [[ $# -ge 2 ]] || die "missing fqdn for --repin"; repin_fq="$2"; shift 2
+                if [[ $# -ge 1 && $1 != --* ]]; then repin_ad="$1"; shift; fi;;
     *) die "unknown argument '$1'";;
   esac; done
   if ((status)); then   # read-only: for the operator and for "done yet?" (#1283)
@@ -767,8 +782,20 @@ main() {
   fi
   [[ -n "$ROOT" || $EUID -eq 0 ]] || die "must run as root: found uid $EUID"
 
+  if [[ -n "$repin_fq" ]]; then   # rename procedure (#1289): the pin follows the new name
+    local ra rs; ra="${repin_ad:-$(awk '{print $1; exit}' "$HOSTS_PIN" 2>/dev/null)}"
+    rs="$(awk '{print $3; exit}' "$HOSTS_PIN" 2>/dev/null)"
+    [[ -n "$ra" ]] || die "no address: pass one, or run on a converted box with ${HOSTS_PIN}"
+    [[ "$repin_fq" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+$ ]] || die "--repin: '${repin_fq}' is not a lowercase FQDN"
+    [[ "$ra" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "--repin: '${ra}' is not a dotted IPv4"
+    [[ -n "$repin_ad" ]] && rs=override   # an address typed by hand is never a probe
+    printf '%s %s %s\n' "$ra" "$repin_fq" "${rs:-probe}" > "$HOSTS_PIN" || die "cannot write ${HOSTS_PIN}"
+    log "pin rewritten: ${repin_fq} ${ra}"; exit 0
+  fi
   if ((pin)); then   # boot-time unit (#1283): before pve-cluster, with or without the done marker
-    local pa ph; read -r pa ph < "$HOSTS_PIN" 2>/dev/null; [[ -n "${pa:-}" && -n "${ph:-}" ]] || die "no pinned hosts entry in ${HOSTS_PIN}"
+    local pa ph po; read -r pa ph po < "$HOSTS_PIN" 2>/dev/null; [[ -n "${pa:-}" && -n "${ph:-}" ]] || die "no pinned hosts entry in ${HOSTS_PIN}"
+    # A moved box (#1289): the address is no longer configured, so the pin is stale; leave /etc/hosts alone.
+    [[ "${po:-probe}" == override ]] || pin_address_current "$pa" || { log "pin ${pa} is not this box's configured address any more; not re-pinning"; exit 0; }
     apply_name "$ph" "$pa"; log "hosts pinned at boot: ${ph}"; exit 0
   fi
   [[ -e "$DONE_MARK" ]] && { log "already converted (${DONE_MARK}); nothing to do"; exit 0; }
