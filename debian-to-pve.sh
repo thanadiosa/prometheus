@@ -406,6 +406,8 @@ verify_bootable() {
   fi
   grep -q 'vmlinuz-.*-pve' "${ROOT}/boot/grub/grub.cfg" 2>/dev/null \
     || die "BOOT CHECK: /boot/grub/grub.cfg does not mention the Proxmox kernel (vmlinuz-*-pve)"
+  grep -q 'libata\.force=nolpm' "${ROOT}/boot/grub/grub.cfg" 2>/dev/null \
+    || die "BOOT CHECK: /boot/grub/grub.cfg lacks libata.force=nolpm (the SATA link power pin of #1325 did not reach the boot entries)"
   log "boot check ok: ${kv}$( ((md)) && echo ', md array in initramfs + mdadm.conf')"
 }
 # Facts for a freeze we may not be able to read afterwards (#1283): into the 0600 log.
@@ -478,6 +480,9 @@ PY
 }
 
 # The Proxmox kernel defaults SATA links to min_power_with_partial, which drops some SSDs (#1325).
+# A udev rule applies only after the ports are up, too late: the kernel command line pins it from first boot.
+SATA_LPM_GRUB="${ROOT}/etc/default/grub.d/98-provisioner-sata-lpm.cfg"
+SATA_LPM_PARAMS="libata.force=nolpm ahci.mobile_lpm_policy=1"
 SATA_LPM_RULE="${ROOT}/etc/udev/rules.d/99-provisioner-sata-lpm.rules"
 pin_sata_lpm() {  # udev rule for every boot + the live write now; hosts without the attribute are skipped
   mkdir -p "$(dirname "$SATA_LPM_RULE")"
@@ -489,6 +494,12 @@ pin_sata_lpm() {  # udev rule for every boot + the live write now; hosts without
     if printf 'max_performance' > "$f" 2>/dev/null; then set+=" $(basename "$(dirname "$f")")"; fi
   done
   log "SATA link power policy: max_performance written for:${set:- no SATA host}"
+  # GRUB_CMDLINE_LINUX, not _DEFAULT (cloud-init sets that wholesale); a rewritten file keeps one copy (#1325)
+  mkdir -p "$(dirname "$SATA_LPM_GRUB")"
+  printf '%s\n%s\n' '# SATA link power management off from the first boot of the Proxmox kernel (#1325)' \
+    "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX ${SATA_LPM_PARAMS}\"" > "$SATA_LPM_GRUB" \
+    || die "cannot write ${SATA_LPM_GRUB}"
+  log "SATA link power: kernel command line pinned (${SATA_LPM_PARAMS}) in ${SATA_LPM_GRUB#"$ROOT"}, applied by update-grub"
 }
 sata_lpm_failures() {  # one phrase per SATA host not on max_performance
   local f v
@@ -496,6 +507,10 @@ sata_lpm_failures() {  # one phrase per SATA host not on max_performance
     [[ -e "$f" ]] || continue
     v="$(cat "$f" 2>/dev/null)"
     [[ "$v" == max_performance ]] || echo "SATA $(basename "$(dirname "$f")") link power policy is '${v}', not max_performance"
+  done
+  local p cl; cl="$(cat "${ROOT}/proc/cmdline" 2>/dev/null)"
+  for p in $SATA_LPM_PARAMS; do
+    [[ " $cl " == *" $p "* ]] || echo "the running kernel's command line lacks ${p} (SATA link power pin, #1325)"
   done
 }
 md_degraded_warn() {  # a mirror that lost a member shows an underscore inside [UU] (#1325); a warning, not a failure
