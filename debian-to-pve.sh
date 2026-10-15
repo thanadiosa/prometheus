@@ -349,10 +349,25 @@ probe_boot_disk() {  # whole disk(s) under /boot (partition/LVM/md walked, #1260
 render_grub_preseed() {  # <disk[, disk...]> (debconf's multiselect form, #1260)
   printf 'grub-pc grub-pc/install_devices multiselect %s\ngrub-pc grub-pc/install_devices_empty boolean false\ngrub-pc grub-pc/install_devices_failed boolean false\n' "$1"
 }
+bios_capable() {  # <disk> -> 0 if grub can embed there: an MBR disk, or a GPT disk with a BIOS boot partition (#1317)
+  local j; j="$(sfdisk --json "$1" 2>/dev/null)" || return 0   # unreadable: keep it, let grub-install judge
+  grep -qi '"label": *"gpt"' <<<"$j" || return 0
+  grep -qi '21686148-6449-6E6F-744E-656564454649' <<<"$j"
+}
+limit_grub_disks() {  # <disk[, disk...]> -> the subset able to hold the loader; refuses if none (#1317)
+  local d keep="" drop=""
+  for d in ${1//,/ }; do
+    if bios_capable "$d"; then keep+="${keep:+, }${d}"; else drop+="${drop:+, }${d}"; fi
+  done
+  [[ -n "$keep" ]] || die "no disk carries a BIOS boot partition (${drop}): grub-pc cannot install on a GPT disk without one; add the 1 MiB 'legacy' partition at the provider"
+  [[ -z "$drop" ]] || log "grub-pc: dropping ${drop} from the install devices: GPT disk with no BIOS boot partition, grub-install would fail on it (#1317)"
+  printf '%s' "$keep"
+}
 preseed_grub() {
   if [[ -e "${ROOT}/sys/firmware/efi" ]]; then log "EFI boot: no grub-pc preseed needed"; return 0; fi
   local d; d="$(probe_boot_disk)" || { warn "cannot find the disk holding /boot; grub-pc preseed skipped"; return 0; }
   [[ -n "$d" ]] || { warn "empty boot disk; grub-pc preseed skipped"; return 0; }
+  d="$(limit_grub_disks "$d")" || exit $?   # a subshell's die must still stop us (#1317)
   log "grub-pc install device: ${d}"
   render_grub_preseed "$d" | real debconf-set-selections || die "debconf preseed for grub-pc failed"
 }
@@ -462,6 +477,34 @@ PY
   return 0
 }
 
+# The Proxmox kernel defaults SATA links to min_power_with_partial, which drops some SSDs (#1325).
+SATA_LPM_RULE="${ROOT}/etc/udev/rules.d/99-provisioner-sata-lpm.rules"
+pin_sata_lpm() {  # udev rule for every boot + the live write now; hosts without the attribute are skipped
+  mkdir -p "$(dirname "$SATA_LPM_RULE")"
+  printf '%s\n%s\n' '# SATA links stay at full power: the Proxmox kernel default drops some SSDs (#1325)' \
+    'ACTION=="add", SUBSYSTEM=="scsi_host", KERNEL=="host*", ATTR{link_power_management_policy}="max_performance"' > "$SATA_LPM_RULE"
+  local f set=""
+  for f in "${ROOT}"/sys/class/scsi_host/host*/link_power_management_policy; do
+    [[ -e "$f" ]] || continue
+    if printf 'max_performance' > "$f" 2>/dev/null; then set+=" $(basename "$(dirname "$f")")"; fi
+  done
+  log "SATA link power policy: max_performance written for:${set:- no SATA host}"
+}
+sata_lpm_failures() {  # one phrase per SATA host not on max_performance
+  local f v
+  for f in "${ROOT}"/sys/class/scsi_host/host*/link_power_management_policy; do
+    [[ -e "$f" ]] || continue
+    v="$(cat "$f" 2>/dev/null)"
+    [[ "$v" == max_performance ]] || echo "SATA $(basename "$(dirname "$f")") link power policy is '${v}', not max_performance"
+  done
+}
+md_degraded_warn() {  # a mirror that lost a member shows an underscore inside [UU] (#1325); a warning, not a failure
+  [[ -r "${ROOT}/proc/mdstat" ]] || return 0
+  local a n
+  a="$(awk '/^md[0-9]+ :/ {n=$1} /\[[0-9]+\/[0-9]+\] \[[U_]*_[U_]*\]/ {print n}' "${ROOT}/proc/mdstat")"
+  for n in $a; do warn "md mirror ${n} is DEGRADED (a member is missing, see ${ROOT}/proc/mdstat): the box boots but is not redundant"; done
+}
+
 # ── phase 1 ────────────────────────────────────────────────────────────────────────────────
 phase1() {
   local host addr up
@@ -501,6 +544,7 @@ phase1() {
   # cloud-init must not rewrite the network once the card is a bridge (next boot would undo it)
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
   printf 'network: {config: disabled}\n' > "$CI_NET_CFG"
+  pin_sata_lpm   # before the Proxmox kernel is installed (#1325)
 
   # keyring, pinned
   [[ -n "$KEYRING_SHA256" ]] || die "the Proxmox keyring hash is not pinned in this script (KEYRING_SHA256 empty): refusing to trust an unverified download"
@@ -737,6 +781,7 @@ post_boot_failures() {  # prints what is wrong, one phrase per line; empty = all
   [[ -e "${ROOT}/sys/class/net/vmbr0/brif/${PORT_NAME}" ]] || echo "vmbr0 has no port ${PORT_NAME}"
   [[ "$(probe_uplink)" == vmbr0 ]] || echo "the default route is not on vmbr0"
   [[ -s "${ROOT}/etc/pve/storage.cfg" ]] || echo "/etc/pve/storage.cfg is empty or missing"
+  sata_lpm_failures
 }
 post_boot_diagnostics() {  # what the next person needs to read, in the 0600 conversion log
   {
@@ -800,6 +845,7 @@ post_boot() {
     [[ -e $KEYS_OK && -s ${ROOT}/root/.ssh/authorized_keys2 && -e $SSHD_DROPIN ]] && reach="root access configured via authorized_keys2"
     DIE_RC=1 die "post-boot check failed again: no further automatic restart; the box stays up, ${reach}; the resume unit stays armed; read ${LOG_FILE}"
   fi
+  md_degraded_warn
   disarm_resume
   : > "$DONE_MARK"
   log "DONE: Proxmox VE is installed and survived its restart on ${host}; run the console one-liner"
