@@ -517,7 +517,109 @@ md_degraded_warn() {  # a mirror that lost a member shows an underscore inside [
   [[ -r "${ROOT}/proc/mdstat" ]] || return 0
   local a n
   a="$(awk '/^md[0-9]+ :/ {n=$1} /\[[0-9]+\/[0-9]+\] \[[U_]*_[U_]*\]/ {print n}' "${ROOT}/proc/mdstat")"
-  for n in $a; do warn "md mirror ${n} is DEGRADED (a member is missing, see ${ROOT}/proc/mdstat): the box boots but is not redundant"; done
+  for n in $a; do dwarn "md mirror ${n} is DEGRADED (a member is missing, see ${ROOT}/proc/mdstat): the box boots but is not redundant"; done
+}
+
+# ── disk record (#1325): what the box sees of its disks, so a lost disk leaves evidence ────────
+# Written in phase 1 (Debian kernel) and again at the first Proxmox-kernel boot, appended with a
+# UTC stamp. Warnings only, never a refusal: a worn but serving disk must not stop a conversion.
+DISK_REC="${STATE_DIR}/disks.txt"
+DISK_WARNS=0
+SMARTCTL="${DEBIAN_TO_PVE_SMARTCTL:-smartctl}"
+dwarn() { DISK_WARNS=$((DISK_WARNS+1)); warn "$*"; }
+drec()  { printf '%s\n' "$*" >> "$DISK_REC"; log "disk: $*"; }
+DISK_TMO="${DEBIAN_TO_PVE_DISK_TIMEOUT:-30}"   # a hung disk is the case this record exists for (#1325)
+tmo() {  # <tool label> <disk> cmd... -> output in $TMO_OUT; a timeout is a WARN, never a stall
+  local lbl="$1" d="$2"; shift 2
+  TMO_OUT="$(timeout -k 2 "$DISK_TMO" "$@" 2>&1)"; local rc=$?
+  (( rc != 124 )) || dwarn "${lbl} timed out on ${d}"
+  return $rc
+}
+KLOG_LINES=20000   # an ATA error storm must not blow up memory or time (#1325)
+kernel_log() {  # <file>: the last KLOG_LINES lines (and at most ~4 MB) of this boot's kernel log
+  local f="$1" rc
+  timeout -k 2 "$DISK_TMO" journalctl -k -b --no-pager -q 2>/dev/null | tail -n "$KLOG_LINES" | tail -c 4000000 > "$f"
+  rc=${PIPESTATUS[0]}; (( rc != 124 )) || dwarn "journalctl timed out on the kernel log"
+  [[ -s "$f" ]] && return 0
+  timeout -k 2 "$DISK_TMO" dmesg 2>/dev/null | tail -n "$KLOG_LINES" | tail -c 4000000 > "$f"
+  rc=${PIPESTATUS[0]}; (( rc != 124 )) || dwarn "dmesg timed out on the kernel log"
+}
+smart_raw() {  # <attribute name> <smartctl text> -> raw value (first word), empty if absent
+  awk -v n="$1" '$2==n {print $10; exit}' <<<"$2"
+}
+smart_disk() {  # <disk>
+  local d="$1" t a v w
+  tmo smartctl "$d" "$SMARTCTL" -H -A "/dev/$d"; t="$TMO_OUT"
+  v="$(sed -n 's/^SMART overall-health self-assessment test result: *//p' <<<"$t" | head -n1)"
+  drec "${d} smart health: ${v:-unknown}"
+  [[ -z "$v" || "$v" == PASSED ]] || dwarn "disk ${d}: SMART overall health is ${v}, not PASSED"
+  for a in Reallocated_Event_Count Reallocated_Sector_Ct Current_Pending_Sector Offline_Uncorrectable UDMA_CRC_Error_Count Percent_Lifetime_Remain Power_On_Hours Unexpect_Power_Loss_Ct; do
+    v="$(smart_raw "$a" "$t")"; [[ -n "$v" ]] || continue
+    if [[ $a == Percent_Lifetime_Remain ]]; then drec "${d} ${a} raw=${v} (on Micron drives the raw value is the percent USED)"
+    else drec "${d} ${a} raw=${v}"; fi
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    case "$a" in
+      Reallocated_*|Current_Pending_Sector|Offline_Uncorrectable) (( v > 0 )) && dwarn "disk ${d}: ${a} is ${v}, the disk has bad sectors" ;;
+      UDMA_CRC_Error_Count) (( v > 0 )) && dwarn "disk ${d}: ${a} is ${v}, the cable or link has dropped data" ;;
+      Percent_Lifetime_Remain) (( v >= 90 )) && dwarn "disk ${d}: ${v} percent of its rated lifetime is used" ;;
+    esac
+  done
+}
+wcache_disk() {  # <disk> -> write cache on/off/unknown, warned when off
+  local d="$1" o st=unknown
+  tmo hdparm "$d" hdparm -W "/dev/$d"; o="$TMO_OUT"
+  if grep -qiE 'write-caching *= *0|\(off\)' <<<"$o"; then st=off
+  elif grep -qiE 'write-caching *= *1|\(on\)' <<<"$o"; then st=on
+  elif command -v "$SMARTCTL" >/dev/null 2>&1; then
+    tmo smartctl "$d" "$SMARTCTL" -g wcache "/dev/$d"; o="$TMO_OUT"
+    if grep -qi 'write cache is: *disabled' <<<"$o"; then st=off; elif grep -qi 'write cache is: *enabled' <<<"$o"; then st=on; fi
+  fi
+  drec "${d} write cache: ${st}"
+  [[ "$st" != off ]] || dwarn "disk ${d}: the write cache is off"
+}
+ata_trouble() {  # <whole-disk names...>: counts the kernel's ATA complaints since boot, per pattern and per disk
+  local kl p n d dl list="" ata
+  kl="$(mktemp)" || return 0; kernel_log "$kl"
+  for p in 'failed command' 'SError' 'CommWake' 'failed to IDENTIFY' 'Disk failure on' 'kicking non-fresh'; do
+    n="$(grep -c -- "$p" "$kl")"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    list=""
+    if (( n > 0 )); then
+      for d in "$@"; do
+        ata="$(readlink -m "${ROOT}/sys/block/${d}" 2>/dev/null | grep -o '/ata[0-9]*/' | head -n1 | tr -d /)"
+        dl="$(grep -- "$p" "$kl" | grep -cE "(^|[^a-z0-9])${d}[0-9]*([^a-z0-9]|$)${ata:+|(^|[^a-z0-9])${ata}[.:]}")"
+        (( dl > 0 )) && list+=" ${d}=${dl}"
+      done
+    fi
+    drec "kernel log since boot: '${p}' lines: ${n}${list:+ (by disk:${list})}"
+    (( n == 0 )) || dwarn "the kernel log has ${n} '${p}' line(s) since boot${list:+ (by disk:${list})}"
+  done
+  rm -f "$kl"
+}
+disk_record() {  # <phase1|post-boot>
+  local ph="$1" d rest list=""
+  if [[ -n "$ROOT" && "${DEBIAN_TO_PVE_DISK_RECORD:-}" != 1 ]]; then log "probe root: skipping the disk record"; return 0; fi
+  mkdir -p "$STATE_DIR"; ( umask 077; : >>"$DISK_REC" )
+  DISK_WARNS=0
+  drec "== $(date -u +%FT%TZ) ${ph} kernel $(probe_running_kernel) =="
+  if [[ "$ph" == phase1 ]] && ! command -v "$SMARTCTL" >/dev/null 2>&1; then
+    # the box has egress now; a failed install only costs the SMART half of the record
+    apt_q update && apt_q install smartmontools || log "disk record: smartmontools could not be installed, SMART skipped"
+  fi
+  while read -r d rest; do
+    [[ -n "$d" ]] || continue
+    drec "disk ${d} size/model/serial/rota: ${rest}"; list+=" $d"
+  done < <(lsblk -d -n -e 1,7,11 -o NAME,SIZE,MODEL,SERIAL,ROTA 2>/dev/null)
+  [[ -n "$list" ]] || drec "no whole disk listed by lsblk"
+  if command -v "$SMARTCTL" >/dev/null 2>&1; then
+    for d in $list; do smart_disk "$d"; done
+  else drec "smartctl not available: SMART attributes skipped"; fi
+  if command -v hdparm >/dev/null 2>&1 || command -v "$SMARTCTL" >/dev/null 2>&1; then
+    for d in $list; do wcache_disk "$d"; done
+  else drec "neither hdparm nor smartctl available: write cache state skipped"; fi
+  # shellcheck disable=SC2086
+  ata_trouble $list
+  md_degraded_warn
+  drec "disk record (${ph}): ${DISK_WARNS} warnings"
 }
 
 # ── phase 1 ────────────────────────────────────────────────────────────────────────────────
@@ -560,6 +662,7 @@ phase1() {
   mkdir -p "${ROOT}/etc/cloud/cloud.cfg.d"
   printf 'network: {config: disabled}\n' > "$CI_NET_CFG"
   pin_sata_lpm   # before the Proxmox kernel is installed (#1325)
+  disk_record phase1   # Debian kernel's view of the disks, before anything is installed (#1325)
 
   # keyring, pinned
   [[ -n "$KEYRING_SHA256" ]] || die "the Proxmox keyring hash is not pinned in this script (KEYRING_SHA256 empty): refusing to trust an unverified download"
@@ -841,6 +944,7 @@ post_boot() {
   # shellcheck disable=SC1090
   . "$STATE_ENV" 2>/dev/null; host="${DEBIAN_TO_PVE_HOSTNAME:-?}"
   log "post-boot check on kernel $(probe_running_kernel)"
+  disk_record post-boot   # the first Proxmox-kernel view, kept even if the check then fails (#1325)
   if curl -fsI --max-time 10 "$KEYRING_URL" >/dev/null 2>&1; then log "off-box: ${KEYRING_URL%%/debian*} reachable"; else warn "off-box: cannot reach ${KEYRING_URL%%/debian*} (not a failure)"; fi
   post_boot_round
   if [[ -n "$bad" ]]; then
@@ -860,10 +964,9 @@ post_boot() {
     [[ -e $KEYS_OK && -s ${ROOT}/root/.ssh/authorized_keys2 && -e $SSHD_DROPIN ]] && reach="root access configured via authorized_keys2"
     DIE_RC=1 die "post-boot check failed again: no further automatic restart; the box stays up, ${reach}; the resume unit stays armed; read ${LOG_FILE}"
   fi
-  md_degraded_warn
   disarm_resume
   : > "$DONE_MARK"
-  log "DONE: Proxmox VE is installed and survived its restart on ${host}; run the console one-liner"
+  log "DONE: Proxmox VE is installed and survived its restart on ${host}; run the console one-liner; disk record: ${DISK_WARNS} warnings"
 }
 
 # One conversion run at a time: the resume unit and a hand start must not overlap (#1283).
