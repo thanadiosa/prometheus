@@ -548,7 +548,7 @@ smart_raw() {  # <attribute name> <smartctl text> -> raw value (first word), emp
   awk -v n="$1" '$2==n {print $10; exit}' <<<"$2"
 }
 smart_disk() {  # <disk>
-  local d="$1" t a v w
+  local d="$1" t a v
   tmo smartctl "$d" "$SMARTCTL" -H -A "/dev/$d"; t="$TMO_OUT"
   v="$(sed -n 's/^SMART overall-health self-assessment test result: *//p' <<<"$t" | head -n1)"
   drec "${d} smart health: ${v:-unknown}"
