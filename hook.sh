@@ -278,7 +278,7 @@ hook_crypt_weak() {   # <password> -> rc 0 strong enough, 1 weak or unreadable; 
 hook_crypt_derive_store() {   # <password> -> derive from it, store as derived-v1; rc 1 = nothing stored
   local k k1 k2
   k="$(printf '%s' "$1" | hook_crypt_derive "${estate:-}")" || return 1
-  k1="$(sed -n 1p <<<"$k")"; k2="$(sed -n 2p <<<"$k")"
+  k1="${k%%$'\n'*}"; k2="${k#*$'\n'}"; k2="${k2%%$'\n'*}"   # no here-string: old bash puts one in a temp file
   [[ $k1 =~ ^[0-9a-f]{64}$ && $k2 =~ ^[0-9a-f]{64}$ && $k1 != "$k2" ]] || return 1
   hook_crypt_store "$k1" "$k2" "derived-v1 ${estate}"
 }
@@ -296,7 +296,11 @@ hook_crypt_vault_from_file() {   # <file> -> refuse a weak password, else derive
   [[ -f $f && -r $f ]] || return 1
   [[ -z $(find "$f" -maxdepth 0 -perm /077 2>/dev/null) ]] || die "PROVISIONER_VAULT_PASS_FILE ${f} is readable by others - chmod 600 it and re-run"
   [[ -n ${PROVISIONER_ESTATE:-} ]] || die "deriving the seedbox key unattended needs PROVISIONER_ESTATE (the estate name is part of the key)"
-  vp="$(sed -n 1p "$f" | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r\n')"; [[ -n $vp ]] || return 1
+  local ws=$' \t\n\r\v\f' lead
+  vp="$(cat -- "$f" 2>/dev/null; printf x)"; vp="${vp%x}"; vp="${vp#$'\xEF\xBB\xBF'}"
+  lead="${vp%%[!"$ws"]*}"; vp="${vp#"$lead"}"; lead="${vp##*[!"$ws"]}"; vp="${vp%"$lead"}"
+  [[ $vp != *$'\n'* ]] || { unset vp; return 1; }
+  [[ -n $vp ]] || return 1
   if ! hook_crypt_weak "$vp"; then unset vp; die "$HOOK_CRYPT_WEAK_MSG"; fi
   hook_crypt_derive_store "$vp"; rc=$?; unset vp
   log "the vault password file ${f} was read; remove it when this run is done"
