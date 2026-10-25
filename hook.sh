@@ -320,7 +320,7 @@ hook_crypt_key_interview() {
   elif [[ ${PROVISIONER_HELPER_ACCESS:-} == rclone ]] || { [[ -s $HELPER_ACCESS && ! -e $HELPER_CRYPT_NONE ]]; }; then   # #1202: third answer, no key
     [[ ${PROVISIONER_HELPER_ACCESS:-} != rclone ]] || rm -f "$HELPER_CRYPT_NONE"   # an explicit setting is newer than an old "none"
     [[ -s $HELPER_ACCESS ]] || ( umask 022; printf 'rclone\n' > "$HELPER_ACCESS" ) || die "could not record the access-path setting at ${HELPER_ACCESS}"
-    log "seedbox reached through the access path without encryption (#1202; remove ${HELPER_ACCESS} to be asked again)"
+    log "seedbox reached through the access path without encryption (remove ${HELPER_ACCESS} to be asked again)"
   elif [[ -e $HELPER_CRYPT_NONE ]]; then
     log "no seedbox encryption (chosen on an earlier run; remove ${HELPER_CRYPT_NONE} to be asked again, or name a key file in PROVISIONER_HELPER_CRYPT_KEY_FILE)"
   elif [[ $scheme == derived-v1 && -n $vf ]]; then   # #1250: opt-in only (scheme AND file); a none or access setting above always wins
@@ -332,7 +332,7 @@ hook_crypt_key_interview() {
       case "${ans:-$dflt}" in
         n|N|no) ( umask 077; : > "$HELPER_CRYPT_NONE" ) 2>/dev/null; log "no seedbox encryption chosen"; break ;;
         a|A) ( umask 022; printf 'rclone\n' > "$HELPER_ACCESS" ) || die "could not record the access-path setting at ${HELPER_ACCESS}"
-             log "no seedbox encryption; the seedbox is reached through the access path (#1202)"; break ;;
+             log "no seedbox encryption; the seedbox is reached through the access path"; break ;;
         d|D)
           if [[ -z ${PROVISIONER_ESTATE:-} ]]; then
             read -rp "deriving for estate ${estate} (the name is part of the key). Right? y / n (default y): " ans <"$hook_tty_dev"
@@ -405,17 +405,17 @@ if [[ -n $embedded_rd ]]; then
   log "helper remote dir set from the combined address: ${_RD}"
 elif [[ -n $_RD || $_RD_FROM_ENV == 1 ]]; then
   RD_SRC="PROVISIONER_REMOTE_DIR in the environment"
-  log "helper remote dir '${_RD}' taken from PROVISIONER_REMOTE_DIR (an explicit value outranks this box's staged fact — issue #834)"
+  log "helper remote dir '${_RD}' taken from PROVISIONER_REMOTE_DIR (an explicit value outranks this box's staged fact)"
 elif (( RD_FACT_HAVE )); then
   _RD="$RD_FACT"
   RD_SRC="${RD_FACT_FILE}, this box's own staged fact"
-  log "helper remote dir '${_RD}' read from ${RD_FACT_FILE} — the layout a previous lap staged on this host, which beats guessing the well-known base (issue #834)"
+  log "helper remote dir '${_RD}' read from ${RD_FACT_FILE} — the layout a previous lap staged on this host, which beats guessing the well-known base"
 else
   RD_PROBE=1
   RD_SRC="probing the helper — nothing was typed, no PROVISIONER_REMOTE_DIR, and this box carries no ${RD_FACT_FILE}"
 fi
 (( RD_FACT_UNREADABLE )) \
-  && say "this box carries ${RD_FACT_FILE} but it could not be read — the layout it names was NOT used (issue #834). Check it with: ls -l ${RD_FACT_FILE}"
+  && say "this box carries ${RD_FACT_FILE} but it could not be read — the layout it names was NOT used. Check it with: ls -l ${RD_FACT_FILE}"
 SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
 SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
@@ -706,7 +706,7 @@ _scrub() { local t h="${HELPER#*@}" u="${HELPER%%@*}"; t="$(cat)"; t="${t//"$HEL
 ensure_rclone() {
   command -v rclone >/dev/null 2>&1 && return 0     # any rclone speaks crypt; the role pins the fleet's
   [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ] \
-    || { say "no rclone here and only the amd64 package is pinned (#1075) - install rclone by hand"; return 4; }
+    || { say "no rclone here and only the amd64 package is pinned - install rclone by hand"; return 4; }
   local d deb url got
   d="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/prov-rclone-dl.XXXXXX")" || { say "cannot make a scratch dir"; return 4; }
   deb="${d}/rclone.deb"
@@ -761,7 +761,7 @@ crypt_get() {
   chmod 600 "${D}/rclone.conf"
   if _helper_crypt_alias; then   # #1202: an encrypted folder read without its key looks empty - refuse, do not call it "not there"
     rclone --config "${D}/rclone.conf" --contimeout "${HELPER_CONNECT_TIMEOUT}s" --retries 1 --low-level-retries 1 lsf prov-crypt: 2>/dev/null </dev/null | _helper_crypt_looks_encrypted \
-      && { say "this folder is encrypted; the access path without a key would read it as empty - refusing (#1202)"; return 4; }
+      && { say "this folder is encrypted; the access path without a key would read it as empty - refusing"; return 4; }
   fi
   timeout -k 5 "${PROVISIONER_CRYPT_FETCH_TIMEOUT:-120}" rclone --config "${D}/rclone.conf" --contimeout "${HELPER_CONNECT_TIMEOUT}s" --retries 1 --low-level-retries 1 \
     copyto -- "$rp" "$(_helper_crypt_local "$TMPDST")" >/dev/null 2>"${D}/err" </dev/null &
@@ -824,7 +824,7 @@ hook_crypt_probe() {   # <workdir> <cand0> <cand1>
       0) ;;
       3) printf 'remote open("%s"): No such file or directory\n' "$c" ;;
       2) printf 'Permission denied (password).\n'; worst=255   # a refused login ends the probe: a second candidate would be a second sign-in (#1203)
-         log "the helper REFUSED the login - not retried on the second candidate (#1201, #1203)"; break ;;
+         log "the helper REFUSED the login - not retried on the second candidate"; break ;;
       4) printf 'crypt mode could not run (see above)\n'; worst=255 ;;
       5) printf 'Host key verification failed.\n'; worst=255 ;;
       *) printf 'Connection timed out\n'; worst=255 ;;
@@ -894,7 +894,7 @@ Your helper password has been KEPT — it was never the problem.
     hostkey)
       fetch_fail_reason="the helper's HOST KEY does not match ~/.ssh/known_hosts — not a password problem.
 This host's known_hosts is only ever appended to (ssh-keyscan), never pruned, and this estate's
-helper/host keys churn on reinstall (issue #28). Drop the stale entry and re-run:
+helper/host keys churn on reinstall. Drop the stale entry and re-run:
   ssh-keygen -R '[${helper_server}]:${port}' ; ssh-keygen -R '${helper_server}'
 Your helper password has been KEPT — it was never the problem."
       return 3;;
@@ -930,7 +930,7 @@ and do NOT re-stage anything until that has been tried."
 Your helper password has been KEPT — it was never the problem.
 BEFORE RE-STAGING ANYTHING, CHECK WHICH DIRECTORY IS ACTUALLY EMPTY. A deploy aimed at a wrongly
 resolved remote dir writes this estate's boot scripts into the SHARED PARENT account, where it
-reports success and every other estate can then read them (issue #313). Re-run genesis.sh's
+reports success and every other estate can then read them. Re-run genesis.sh's
 deploy ONLY once the directory named above is confirmed to be this estate's own and confirmed
 empty." ; return 3;;
     transport)
@@ -955,7 +955,7 @@ _pw_probe_offered_password() {   # <transcript> → 1 ONLY when a method list pr
 
 pw_probe_out=""; pw_probe_rc=0; pw_probe_class=""; pw_probe_fate=""; pw_probe_why=""
 if [[ -s $HELPER_PASS_FILE ]] && hook_access_path_only; then
-  log "access path: the password is proven by the first fetch, not by a separate sign-in (#1203)"
+  log "access path: the password is proven by the first fetch, not by a separate sign-in"
 elif [[ -s $HELPER_PASS_FILE ]]; then
   pw_probe_out="$(printf 'exit\n' | hook_sftp_pass)"; pw_probe_rc=$?
   pw_probe_class="$(classify_ssh_failure "$pw_probe_out" "$pw_probe_rc")"
@@ -977,8 +977,8 @@ elif [[ -s $HELPER_PASS_FILE ]]; then
     die "the helper REFUSED this password — nothing has been provisioned.
 No VM, no user, no sshd change, and not one byte fetched: this was a password-only login against ${helper} on :${port}, made exactly once, before the bootstrap fetched anything.
 ${pw_probe_fate}
-WHY THIS STOPS THE RUN RATHER THAN CARRYING ON (issue #877). The helper may well accept this box's KEY and let the whole bootstrap complete — that is precisely how a stale password reached a live estate on 2026-09-19. The password is a credential in its OWN right: rclone's sftp backend, which backs the players up, can authenticate with nothing else. Carried untested it fails ninety minutes later, inside the VMs, with nothing on the console pointing back here.
-NOT retrying: each attempt is a real login against the helper and repeated failures can get this estate's IP banned by the helper's provider (issues #87/#90)."
+WHY THIS STOPS THE RUN RATHER THAN CARRYING ON. The helper may well accept this box's KEY and let the whole bootstrap complete — that is precisely how a stale password reached a live estate on 2026-09-19. The password is a credential in its OWN right: rclone's sftp backend, which backs the players up, can authenticate with nothing else. Carried untested it fails ninety minutes later, inside the VMs, with nothing on the console pointing back here.
+NOT retrying: each attempt is a real login against the helper and repeated failures can get this estate's IP banned by the helper's provider."
   else
     warn "could not verify the password (${pw_probe_why}: $(printf '%s' "$pw_probe_out" | tr '\n' ';')) — continuing; the first password-only consumer is the players' backup tool"
     hook_probe_knock=1
@@ -1052,11 +1052,11 @@ hook_probe_remote_dir() {   # <estate> — sets _RD, RD_SRC and the derived path
   rm -rf "$work"
   local where0="'${cands[0]}'" where1="the helper login root"
   if (( both )); then
-    warn "the helper login root also holds boot scripts; ignored, this estate's own folder ${where0} wins (a leftover, issue #1081)"
+    warn "the helper login root also holds boot scripts; ignored, this estate's own folder ${where0} wins (a leftover)"
     verdict[1]=absent
   fi
   if [[ ${verdict[0]} == unknown || ${verdict[1]} == unknown ]]; then
-    fetch_fail_reason="could not tell where this estate's boot scripts are on the helper: ${where0} was '${verdict[0]}' and ${where1} '${verdict[1]}' ('could not list' is not 'absent', issue #1081).
+    fetch_fail_reason="could not tell where this estate's boot scripts are on the helper: ${where0} was '${verdict[0]}' and ${where1} '${verdict[1]}' ('could not list' is not 'absent').
   failure class: $([[ $rc -ne 0 ]] && classify_ssh_failure "$out" "$rc" || printf 'listing refused (session completed)') — the transcript is not printed: it names the helper's address.
 Nothing has been fetched or changed. Fix the cause, or name the directory: re-run with PROVISIONER_REMOTE_DIR=<dir> (empty for a per-estate login root)."
     if [[ $rc -ne 0 ]]; then
@@ -1074,7 +1074,7 @@ Nothing has been fetched or changed. Fix the cause, or name the directory: re-ru
     [[ ${verdict[i]} == present ]] || continue
     _RD="${cands[i]}"
     cand="${_RD:-the helper login root}"
-    RD_SRC="probing the helper — ${cand} holds scripts/helper-lib.sh and the other candidate does not (issue #1081)"
+    RD_SRC="probing the helper — ${cand} holds scripts/helper-lib.sh and the other candidate does not"
     say "helper remote dir: found this estate's boot scripts in ${cand} (nothing was typed or set; both layouts were checked)"
     SCRIPTS_REMOTE="${_RD:+${_RD}/}scripts"
     SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
@@ -1087,13 +1087,13 @@ Nothing has been fetched or changed. Fix the cause, or name the directory: re-ru
     return 0
   done
   if hook_crypt keyed && hook_crypt_folder_is_plain "${cands[0]}" "${cands[1]}"; then
-    die "this estate's folder on the helper is not encrypted, but this host holds an encryption key (${HELPER_CRYPT_KEY}). Either remove that key to use the folder as it is, or move the folder to the encrypted layout first (bin/helper-crypt-move.sh, issue #1078). Nothing was written to the helper (issue #1246)."
+    die "this estate's folder on the helper is not encrypted, but this host holds an encryption key (${HELPER_CRYPT_KEY}). Either remove that key to use the folder as it is, or move the folder to the encrypted layout first (bin/helper-crypt-move.sh). Nothing was written to the helper."
   fi
   if ! hook_crypt keyed && hook_crypt_folder_looks_encrypted "${cands[0]}"; then
-    die "this estate's boot scripts are not on the helper, and the folder holds only names this estate does not use. That is how an encrypted folder looks, but it can also be a folder that was never staged. This host has no encryption key. If the folder is encrypted: set PROVISIONER_HELPER_CRYPT_KEY_FILE to the key file, or run again from a terminal and choose 't' (first remove ${HELPER_CRYPT_NONE} if it exists, or you will not be asked, issue #1076). If it is not encrypted: stage the boot scripts there (issue #313). Nothing was written to the helper."
+    die "this estate's boot scripts are not on the helper, and the folder holds only names this estate does not use. That is how an encrypted folder looks, but it can also be a folder that was never staged. This host has no encryption key. If the folder is encrypted: set PROVISIONER_HELPER_CRYPT_KEY_FILE to the key file, or run again from a terminal and choose 't' (first remove ${HELPER_CRYPT_NONE} if it exists, or you will not be asked). If it is not encrypted: stage the boot scripts there. Nothing was written to the helper."
   fi
   die "this estate's boot scripts are on the helper in NEITHER place it looked: ${where0} (shared account, one folder per estate) nor ${where1} (per-estate account). The login worked; scripts/helper-lib.sh is in neither.
-Nothing has been fetched or changed. Check what is staged where before re-staging anything (issue #313), or name the directory: PROVISIONER_REMOTE_DIR=<dir>."
+Nothing has been fetched or changed. Check what is staged where before re-staging anything, or name the directory: PROVISIONER_REMOTE_DIR=<dir>."
 }
 attempts=$hook_probe_knock
 if hook_crypt_on; then
@@ -1138,7 +1138,7 @@ elif [[ -n ${PROVISIONER_HELPER_ID:-} ]]; then
   log "no helper key identity was established this run — passing the declared PROVISIONER_HELPER_ID='${PROVISIONER_HELPER_ID}' through unchanged (this file did not verify it)"
 elif [[ -s /root/.ssh/id_provisioner_ed25519 ]]; then
   export PROVISIONER_HELPER_ID="/root/.ssh/id_provisioner_ed25519"
-  log "no key identity was established this run, but the #61 per-install key exists — threading /root/.ssh/id_provisioner_ed25519 (this file did not verify it)"
+  log "no key identity was established this run, but the per-install key exists — threading /root/.ssh/id_provisioner_ed25519 (this file did not verify it)"
 elif [[ $auth_hint == password ]]; then
   log "helper auth is 'password' — no key was offered, so no key path is threaded (helper-lib will use its own default only if it ever needs one)"
 elif [[ -s $HELPER_PASS_FILE ]]; then
@@ -1157,7 +1157,7 @@ PREREPO_FINGERPRINTS=""
 _log_prerepo_fingerprints() {
   local f h out=""
   if ! command -v sha256sum >/dev/null 2>&1; then
-    log "pre-repo script fingerprints: no sha256sum on this host — skipping (issue #169)"
+    log "pre-repo script fingerprints: no sha256sum on this host — skipping"
     return 0
   fi
   for f in helper-lib.sh; do
@@ -1170,7 +1170,7 @@ _log_prerepo_fingerprints() {
       out+=" ${f}=absent"
     fi
   done
-  log "pre-repo script fingerprints (sha256/12, as staged on the helper — issue #169):${out} — compared against the checkout once it exists (issue #428)"
+  log "pre-repo script fingerprints (sha256/12, as staged on the helper):${out} — compared against the checkout once it exists"
   return 0
 }
 _log_prerepo_fingerprints
@@ -1191,7 +1191,7 @@ if (( _hd_rc == 0 )); then
 else
   die "cannot reach helper '${helper}' on port ${port} — the deploy key and the seed images both live there, so nothing can proceed.
 ${_hd_last:+Last library line: ${_hd_last}
-}Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them (issue #143).
+}Read the [helper-lib] line above for WHICH fault this is: a refused/unanswered port means nothing was listening and neither the key ('${PROVISIONER_HELPER_ID:-<none threaded>}') nor the password ('${HELPER_PASS_FILE}') was tried — check PROVISIONER_HELPER_PORT before either of them.
 Nothing has been changed on this host."
 fi
 
@@ -1220,15 +1220,15 @@ else
 fi
 
 case "$PROVISIONER_VERSION" in
-  newest|NEWEST) log "version pointer says 'newest' (from ${version_src}) — building the repo's default branch (issue #232)"; PROVISIONER_VERSION=""; version_src="" ;;
+  newest|NEWEST) log "version pointer says 'newest' (from ${version_src}) — building the repo's default branch"; PROVISIONER_VERSION=""; version_src="" ;;
 esac
 
 version_where="the environment (PROVISIONER_VERSION)"
 [[ $version_src == helper ]] && version_where="the helper's version pointer (${VERSION_REMOTE})"
 if [[ -n $PROVISIONER_VERSION ]] && ! ref_is_sane "$PROVISIONER_VERSION"; then
-  die "$(printf 'the requested provisioner version %q is not a usable git ref (issue #232).' "$PROVISIONER_VERSION")
+  die "$(printf 'the requested provisioner version %q is not a usable git ref.' "$PROVISIONER_VERSION")
 It came from ${version_where}.
-A version is a YY.MM.NNN tag (expected like 26.10.001; old names such as 0.2.0 are gone, #1134), a branch,
+A version is a YY.MM.NNN tag (expected like 26.10.001; old names such as 0.2.0 are gone), a branch,
 or a full commit sha: letters, digits and . _ / + - only, no leading '-', no '..', at most 128 characters.
 NOT falling back to the newest code: you asked for a specific version, and building a
 different one under that label is the exact failure this check exists to prevent.
@@ -1238,7 +1238,7 @@ fi
 PROVISIONER_RESTORE_LEGACY_AGAIN="${PROVISIONER_RESTORE_LEGACY_AGAIN:-}"
 if [[ -n $PROVISIONER_RESTORE_LEGACY_AGAIN && $PROVISIONER_RESTORE_LEGACY_AGAIN != all \
       && ( ! $PROVISIONER_RESTORE_LEGACY_AGAIN =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}(,[A-Za-z0-9_][A-Za-z0-9_-]{0,63})*$ || ,${PROVISIONER_RESTORE_LEGACY_AGAIN}, == *,all,* ) ]]; then
-  die "$(printf 'PROVISIONER_RESTORE_LEGACY_AGAIN %q is not usable (#1127).' "$PROVISIONER_RESTORE_LEGACY_AGAIN")
+  die "$(printf 'PROVISIONER_RESTORE_LEGACY_AGAIN %q is not usable.' "$PROVISIONER_RESTORE_LEGACY_AGAIN")
 Give item names (letters, digits, - and _, at most 64 characters, not starting with -) separated by commas, or the word all, or leave it empty.
 Nothing has been provisioned."
 fi
@@ -1246,7 +1246,7 @@ fi
 if [[ -n $PROVISIONER_VERSION ]]; then
   log "building provisioner version '${PROVISIONER_VERSION}' (from ${version_src})"
 else
-  log "no version pinned (${VERSION_REMOTE} absent or empty, and no PROVISIONER_VERSION) — building the newest code, as every lap before issue #232 did"
+  log "no version pinned (${VERSION_REMOTE} absent or empty, and no PROVISIONER_VERSION) — building the newest code, as every lap did before a version could be pinned"
 fi
 
 HOOK_APT_LOCK_WAIT="${PROVISIONER_APT_LOCK_WAIT:-300}"
@@ -1256,9 +1256,9 @@ HOOK_APT_LOCK_RE='could not get lock|unable to acquire the dpkg frontend lock|dp
 install_git() {
   local out rc aptlog
   [[ $HOOK_APT_LOCK_WAIT =~ ^[1-9][0-9]*$ ]] \
-    || die "PROVISIONER_APT_LOCK_WAIT must be a whole number of seconds, 1 or more (got '${HOOK_APT_LOCK_WAIT}'). It bounds how long apt may wait for the package-manager lock. apt reads a negative value as 'wait forever' — the hang issue #303 exists to prevent — and 0 is apt-get's fail-immediately default, which is the #303 bug itself."
-  log "installing git (absent on a stock PVE host — issue #169)"
-  log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang (issue #303)."
+    || die "PROVISIONER_APT_LOCK_WAIT must be a whole number of seconds, 1 or more (got '${HOOK_APT_LOCK_WAIT}'). It bounds how long apt may wait for the package-manager lock. apt reads a negative value as 'wait forever' — the hang this limit exists to prevent — and 0 is apt-get's fail-immediately default, which is the very hang this limit prevents."
+  log "installing git (absent on a stock PVE host)"
+  log "if this box's own first-boot updater is still running, apt will WAIT for the package-manager lock instead of failing — up to ${HOOK_APT_LOCK_WAIT}s per call (update, then install). A pause of a few minutes here is that wait, not a hang."
   aptlog="$(mktemp "${TMPDIR:-/tmp}/hook-apt.XXXXXX" 2>/dev/null || printf '%s/hook-apt.%s' "${TMPDIR:-/tmp}" "$$")"
   _apt_console() {   # stdin = apt's stream; console gets the ticker only, or all of it if verbose
     if [[ ${HOOK_VERBOSE:-0} == 1 ]]; then cat
@@ -1267,7 +1267,7 @@ install_git() {
   _apt_record() {    # full transcript → durable log ONLY, never the console (issue #392)
     [[ -n ${1:-} ]] || return 0
     declare -F _hook_log_file >/dev/null 2>&1 || return 0
-    _hook_log_file "apt transcript (issue #392, kept out of the console, held for the record):
+    _hook_log_file "apt transcript (kept out of the console, held for the record):
 $1"
     return 0
   }
@@ -1282,7 +1282,7 @@ $1"
     return 0
   fi
   if grep -qiE "$HOOK_APT_LOCK_RE" <<<"$out"; then
-    die "could not install git: something else on this box still holds the package manager, after apt waited ${HOOK_APT_LOCK_WAIT}s for it (issue #303).
+    die "could not install git: something else on this box still holds the package manager, after apt waited ${HOOK_APT_LOCK_WAIT}s for it.
 This is NOT an apt misconfiguration and running apt by hand now will fail the same way. A
 freshly installed Proxmox host runs its own first-boot updates; wait for them to finish:
   ps -eo pid,etime,cmd | grep -E '[a]pt|[d]pkg|[u]nattended'
@@ -1291,7 +1291,7 @@ re-run is clean. If NOTHING is running and the lock is still held, the package m
 wedged rather than busy: 'dpkg --configure -a' (and 'rm /var/lib/dpkg/lock-frontend' only if
 dpkg confirms no owner) then re-run. apt said: $(printf '%s' "$out" | grep -iE "$HOOK_APT_LOCK_RE" | head -1)"
   fi
-  die "could not install git, so this box cannot fetch the provisioner code (issue #169).
+  die "could not install git, so this box cannot fetch the provisioner code.
 The pre-repo phase needs exactly one package and this is it. Check apt on this host:
   apt-get update ; apt-get install -y git
 A PVE host with no subscription 401s on the enterprise repo — that alone is harmless, git
@@ -1371,20 +1371,20 @@ if [[ -d "${REPO_DIR}/.git" ]]; then
   log "updating the provisioner checkout at ${REPO_DIR}"
   run_git_step "provisioner checkout fetched (${REPO_DIR})" \
     -- git -C "$REPO_DIR" fetch --prune --tags --force origin \
-    || die "git fetch failed for the existing checkout at ${REPO_DIR} (issue #169/#232).
+    || die "git fetch failed for the existing checkout at ${REPO_DIR}.
 Check outbound network/DNS to github.com and that the deploy key at ${DEPLOY_KEY_REMOTE} still grants READ on parrhasia/prometheus. Or remove ${REPO_DIR} and re-run the hook to clone fresh."
   if [[ -z $PROVISIONER_VERSION ]] && git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
     run_git_step "provisioner checkout fast-forwarded (${REPO_DIR})" \
       -- git -C "$REPO_DIR" pull --ff-only \
-      || die "git pull failed for the existing checkout at ${REPO_DIR} (issue #169).
+      || die "git pull failed for the existing checkout at ${REPO_DIR}.
 A local modification or a diverged branch stops a fast-forward. Inspect it, or remove ${REPO_DIR} and re-run the hook to clone fresh."
   fi
 else
   log "cloning the provisioner repo into ${REPO_DIR}"
   run_git_step "provisioner repo cloned into ${REPO_DIR}" \
     -- git clone --quiet "$REPO_URL" "$REPO_DIR" \
-    || die "git clone failed (issue #169) — this box could not fetch the provisioner code.
-Since #169 the boot chain runs the REPO's code, so there is no staged copy to fall back to.
+    || die "git clone failed — this box could not fetch the provisioner code.
+The boot chain runs the REPO's code, so there is no staged copy to fall back to.
 Check, in this order:
   • outbound network / DNS from this host to github.com
   • the deploy key staged at ${DEPLOY_KEY_REMOTE} on the helper — is it still valid, and does it grant READ on parrhasia/prometheus?
@@ -1395,19 +1395,19 @@ fi
 
 if [[ -n $PROVISIONER_VERSION ]]; then
   pinned_sha="$(resolve_ref "$REPO_DIR" "$PROVISIONER_VERSION")" \
-    || die "the provisioner version '${PROVISIONER_VERSION}' (from ${version_where}) does not exist in parrhasia/prometheus (issue #232).
+    || die "the provisioner version '${PROVISIONER_VERSION}' (from ${version_where}) does not exist in parrhasia/prometheus.
 It was looked for as a tag, as a branch on origin, and as a commit sha — none resolved, after a full fetch.
 NOT falling back to the newest code: a box labelled '${PROVISIONER_VERSION}' that was built from something else is worse than a box that was not built.
 Fix the pointer (or set PROVISIONER_VERSION) and re-run. Nothing has been provisioned (no VM, no user, no sshd change)."
   git -C "$REPO_DIR" checkout --detach "$pinned_sha" \
-    || die "could not check out provisioner version '${PROVISIONER_VERSION}' (${pinned_sha}) in ${REPO_DIR} (issue #232).
+    || die "could not check out provisioner version '${PROVISIONER_VERSION}' (${pinned_sha}) in ${REPO_DIR}.
 git refuses a checkout that would overwrite a locally modified file — that is deliberate, so a debugging edit on this box is never silently discarded. Inspect ${REPO_DIR}, or remove it and re-run the hook to clone fresh."
-  log "checkout pinned at version '${PROVISIONER_VERSION}' → ${pinned_sha} (issue #232)"
+  log "checkout pinned at version '${PROVISIONER_VERSION}' → ${pinned_sha}"
 elif [[ -d "${REPO_DIR}/.git" ]] && ! git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
   _newest="$(default_ref "$REPO_DIR")"
   say "this checkout is detached (a previous lap pinned a version) and nothing is pinned now — moving it back to ${_newest}"
   git -C "$REPO_DIR" checkout --detach "$_newest" \
-    || die "could not move the detached checkout at ${REPO_DIR} back onto ${_newest} (issue #232).
+    || die "could not move the detached checkout at ${REPO_DIR} back onto ${_newest}.
 A locally modified file stops it. Inspect ${REPO_DIR}, or remove it and re-run the hook to clone fresh."
   unset _newest
 fi
@@ -1415,14 +1415,14 @@ fi
 if [[ -n $PROVISIONER_VERSION && -r $NEEDLE_MAIN ]] \
    && command -v grep >/dev/null 2>&1 \
    && ! grep -qs 'PROVISIONER_VERSION' "$NEEDLE_MAIN" "${NEEDLE_MAIN%/*}"/needle-*.sh; then   # needle is split into parts since #948 (#1086)
-  say "WARNING: version '${PROVISIONER_VERSION}' PREDATES version pinning (issue #232).
+  say "WARNING: version '${PROVISIONER_VERSION}' PREDATES version pinning.
 This host will run it, but the needle at that commit cannot pass the version on, so the CONTROL
 NODE it builds will clone the NEWEST code instead — one estate built from two versions.
 If you need the whole estate on '${PROVISIONER_VERSION}', it is not reachable from here: pick a
 ref that contains the version plumbing, or accept that only this host is pinned."
 fi
 
-[[ -r $NEEDLE_MAIN ]] || die "the checkout at ${REPO_DIR} has no ${NEEDLE_MAIN#$REPO_DIR/} — either the clone is incomplete or this commit predates the #169 split.
+[[ -r $NEEDLE_MAIN ]] || die "the checkout at ${REPO_DIR} has no ${NEEDLE_MAIN#$REPO_DIR/} — either the clone is incomplete or this commit predates the split of the boot logic into the repo.
 ${PROVISIONER_VERSION:+A version is pinned ('${PROVISIONER_VERSION}'), so this is most likely a ref from BEFORE the boot chain was split — pick a newer version, or unpin the estate.
 }Remove ${REPO_DIR} and re-run the hook."
 
@@ -1431,10 +1431,10 @@ REPO_COMMIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)" || 
 REPO_COMMIT_DESC="$(git -C "$REPO_DIR" log -1 --format='%h %cI %s' 2>/dev/null)" || REPO_COMMIT_DESC=""
 if [[ -n $REPO_COMMIT ]]; then
   log "running the provisioner repo at ${REPO_COMMIT_SHORT:-$REPO_COMMIT} (version=${PROVISIONER_VERSION:-newest})"
-  log "…that checkout is ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} in ${REPO_DIR} — issue #169/#232: this is the code this lap executes, not a copy staged on the helper"
+  log "…that checkout is ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} in ${REPO_DIR} — this is the code this lap executes, not a copy staged on the helper"
   _hook_feed_line "[hook] provisioner repo cloned at ${REPO_COMMIT_DESC:-$REPO_COMMIT_SHORT} (version=${PROVISIONER_VERSION:-newest})"
 else
-  warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED (issue #169)"
+  warn "cloned/updated ${REPO_DIR} but could not read its commit (git rev-parse failed) — the lap continues UNIDENTIFIED"
 fi
 
 _compare_staged_to_checkout() {
@@ -1446,14 +1446,14 @@ _compare_staged_to_checkout() {
   local genesis_main="${REPO_DIR}/bootstrap/genesis.sh"
   local hook_main="${REPO_DIR}/bootstrap/hook.sh"
   if [[ -z $PREREPO_FINGERPRINTS ]]; then
-    log "staged-vs-checkout: UNKNOWN-not-compared — no pre-repo fingerprint was recorded on this host, so the staged code was NOT judged (issue #428)"
+    log "staged-vs-checkout: UNKNOWN-not-compared — no pre-repo fingerprint was recorded on this host, so the staged code was NOT judged"
     return 0
   fi
   if [[ ! -r $drift_lib ]]; then
-    log "staged-vs-checkout: UNKNOWN-not-compared — this checkout has no bootstrap/staged-drift.sh${PROVISIONER_VERSION:+ (version '${PROVISIONER_VERSION}' predates issue #428)}, so the fingerprints above go uncompared, exactly as they did on every lap before it"
+    log "staged-vs-checkout: UNKNOWN-not-compared — this checkout has no bootstrap/staged-drift.sh${PROVISIONER_VERSION:+ (version '${PROVISIONER_VERSION}' predates)}, so the fingerprints above go uncompared, exactly as they did on every lap before it"
     return 0
   fi
-  . "$drift_lib" || { warn "could not source ${drift_lib} — the staged code was NOT judged this lap (issue #428)"; return 0; }
+  . "$drift_lib" || { warn "could not source ${drift_lib} — the staged code was NOT judged this lap"; return 0; }
   while read -r name sha; do
     [[ -n $name ]] || continue
     n_checked=$((n_checked + 1))
@@ -1477,9 +1477,9 @@ _compare_staged_to_checkout() {
       drift_detail+="  • ${name}: the helper is serving ${STAGED_DETAIL}"$'\n'
     fi
   done <<< "$PREREPO_FINGERPRINTS"
-  log "staged-vs-checkout:${summary} (issue #428 — the pre-repo fingerprints above, judged against ${REPO_COMMIT_SHORT:-this checkout})"
+  log "staged-vs-checkout:${summary} (the pre-repo fingerprints above, judged against ${REPO_COMMIT_SHORT:-this checkout})"
   [[ -n $drift ]] || return 0
-  log "staged-vs-checkout DRIFT (issue #428):
+  log "staged-vs-checkout DRIFT:
 ${drift_detail%$'\n'}"
 
   if (( n_local == n_drift )); then
@@ -1509,7 +1509,7 @@ ${drift_detail%$'\n'}"
   if [[ -n ${PROVISIONER_HOOK_RESTAGED:-} ]]; then
     can_restage=0
     restage_why="a re-stage from this checkout already ran earlier in this boot (from ${PROVISIONER_HOOK_RESTAGED}) and the drift is STILL here — not offering it again"
-    restage_why_long="${restage_why}. Something other than staleness is in play: check that ${genesis_main} actually reached this estate's helper, and that PROVISIONER_REMOTE_DIR ('${PROVISIONER_REMOTE_DIR-<unset>}') names the directory this boot fetched from (issue #313 — a re-stage into the wrong account reports success)."
+    restage_why_long="${restage_why}. Something other than staleness is in play: check that ${genesis_main} actually reached this estate's helper, and that PROVISIONER_REMOTE_DIR ('${PROVISIONER_REMOTE_DIR-<unset>}') names the directory this boot fetched from (a re-stage into the wrong account reports success)."
   elif (( n_local > 0 )); then
     can_restage=0
     restage_why="not re-staging: the difference is this checkout's own local modification, and a re-stage would push it onto the helper"
@@ -1517,11 +1517,11 @@ ${drift_detail%$'\n'}"
   elif [[ -n ${PROVISIONER_VERSION:-} ]]; then
     can_restage=0
     restage_why="not re-staging: this checkout is PINNED at version '${PROVISIONER_VERSION}', so a re-stage would rewind the helper to the pin"
-    restage_why_long="${restage_why} for every later lap of this estate (issue #232). If the pin really is what the helper should serve, run \`bootstrap/genesis.sh helper\` from it deliberately."
+    restage_why_long="${restage_why} for every later lap of this estate. If the pin really is what the helper should serve, run \`bootstrap/genesis.sh helper\` from it deliberately."
   elif [[ -z ${PROVISIONER_REMOTE_DIR+x} ]]; then
     can_restage=0
     restage_why="not re-staging: PROVISIONER_REMOTE_DIR is unset here, and genesis.sh never guesses a helper's layout"
-    restage_why_long="${restage_why} (issue #313) — a re-stage from this environment would either die or stage this estate's boot scripts into the wrong account."
+    restage_why_long="${restage_why} — a re-stage from this environment would either die or stage this estate's boot scripts into the wrong account."
   elif [[ ! -r $genesis_main || ! -r $hook_main ]]; then
     can_restage=0
     restage_why="not re-staging: this checkout has no readable bootstrap/genesis.sh + bootstrap/hook.sh to re-stage and restart with"
@@ -1566,7 +1566,7 @@ ${drift_detail%$'\n'}"
     fi
     if (( read_rc > 128 )); then
       printf '\n%s\n' "continuing (no answer in ${ask_timeout}s)" >&2
-      log "staged-vs-checkout: no answer in ${ask_timeout}s — continuing (issue #58: this question must never be able to wedge a walk-away lap)"
+      log "staged-vs-checkout: no answer in ${ask_timeout}s — continuing (this question must never be able to wedge a walk-away lap)"
       return 0
     elif (( read_rc != 0 )); then
       printf '\n%s\n' "continuing (the console went away while asking)" >&2

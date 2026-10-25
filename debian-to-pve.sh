@@ -123,7 +123,7 @@ restore_root_keys() {
   local k="${STATE_DIR}/root-authorized_keys" dst="${ROOT}/root/.ssh/authorized_keys" line n=0
   [[ -s "$k" ]] || return 0
   # a write under an UNMOUNTED /etc/pve would block the mount later (#1283): rely on authorized_keys2
-  pve_mounted || { warn "pmxcfs is not mounted on /etc/pve: keys not restored there; authorized_keys2 carries them (#1283)"; return 0; }
+  pve_mounted || { warn "pmxcfs is not mounted on /etc/pve: keys not restored there; authorized_keys2 carries them"; return 0; }
   [[ -d "${ROOT}/etc/pve/priv" ]] && dst="${ROOT}/etc/pve/priv/authorized_keys"
   mkdir -p "$(dirname "$dst")"; touch "$dst"
   while IFS= read -r line; do
@@ -138,7 +138,7 @@ restore_root_keys() {
 # because we say so in an explicit drop-in (it wins: first value of a keyword is kept).
 keep_root_keys_outside_pve() {
   local k="${STATE_DIR}/root-authorized_keys" d="${ROOT}/root/.ssh"
-  [[ -s "$k" ]] || { warn "no saved root keys: authorized_keys2 not written (#1283)"; return 0; }
+  [[ -s "$k" ]] || { warn "no saved root keys: authorized_keys2 not written"; return 0; }
   mkdir -p "$d" && chmod 0700 "$d"
   ( umask 077; cat "$k" > "${d}/authorized_keys2" ) || die "cannot write ${d}/authorized_keys2"
   mkdir -p "$(dirname "$SSHD_DROPIN")"
@@ -155,9 +155,9 @@ assert_sshd_reads_keys2() {
   local t; t="$(sshd -T -C user=root,host=x,addr=127.0.0.1 2>>"$LOG_FILE")"
   log "sshd: $(grep -i '^permitrootlogin' <<<"$t" | head -n1)"
   grep -qi '^authorizedkeysfile.*authorized_keys2' <<<"$t" \
-    || die "sshd does not read /root/.ssh/authorized_keys2 (sshd -T): an earlier-sorting drop-in probably out-votes ours; see $(ls "${ROOT}"/etc/ssh/sshd_config.d 2>&1 | tr '\n' ' ') in /etc/ssh/sshd_config.d (#1283)"
+    || die "sshd does not read /root/.ssh/authorized_keys2 (sshd -T): an earlier-sorting drop-in probably out-votes ours; see $(ls "${ROOT}"/etc/ssh/sshd_config.d 2>&1 | tr '\n' ' ') in /etc/ssh/sshd_config.d"
   grep -qiE '^permitrootlogin[[:space:]]+(yes|prohibit-pa[s]sword|without-pa[s]sword)[[:space:]]*$' <<<"$t" \
-    || die "sshd does not let root in by key (permitrootlogin: $(grep -i '^permitrootlogin' <<<"$t" | head -n1)): authorized_keys2 would not help (#1283)"
+    || die "sshd does not let root in by key (permitrootlogin: $(grep -i '^permitrootlogin' <<<"$t" | head -n1)): authorized_keys2 would not help"
   : > "$KEYS_OK"
 }
 
@@ -360,7 +360,7 @@ limit_grub_disks() {  # <disk[, disk...]> -> the subset able to hold the loader;
     if bios_capable "$d"; then keep+="${keep:+, }${d}"; else drop+="${drop:+, }${d}"; fi
   done
   [[ -n "$keep" ]] || die "no disk carries a BIOS boot partition (${drop}): grub-pc cannot install on a GPT disk without one; add the 1 MiB 'legacy' partition at the provider"
-  [[ -z "$drop" ]] || log "grub-pc: dropping ${drop} from the install devices: GPT disk with no BIOS boot partition, grub-install would fail on it (#1317)"
+  [[ -z "$drop" ]] || log "grub-pc: dropping ${drop} from the install devices: GPT disk with no BIOS boot partition, grub-install would fail on it"
   printf '%s' "$keep"
 }
 preseed_grub() {
@@ -407,7 +407,7 @@ verify_bootable() {
   grep -q 'vmlinuz-.*-pve' "${ROOT}/boot/grub/grub.cfg" 2>/dev/null \
     || die "BOOT CHECK: /boot/grub/grub.cfg does not mention the Proxmox kernel (vmlinuz-*-pve)"
   grep -q 'libata\.force=nolpm' "${ROOT}/boot/grub/grub.cfg" 2>/dev/null \
-    || die "BOOT CHECK: /boot/grub/grub.cfg lacks libata.force=nolpm (the SATA link power pin of #1325 did not reach the boot entries)"
+    || die "BOOT CHECK: /boot/grub/grub.cfg lacks libata.force=nolpm (the SATA link power pin did not reach the boot entries)"
   log "boot check ok: ${kv}$( ((md)) && echo ', md array in initramfs + mdadm.conf')"
 }
 # Facts for a freeze we may not be able to read afterwards (#1283): into the 0600 log.
@@ -510,7 +510,7 @@ sata_lpm_failures() {  # one phrase per SATA host not on max_performance
   done
   local p cl; cl="$(cat "${ROOT}/proc/cmdline" 2>/dev/null)"
   for p in $SATA_LPM_PARAMS; do
-    [[ " $cl " == *" $p "* ]] || echo "the running kernel's command line lacks ${p} (SATA link power pin, #1325)"
+    [[ " $cl " == *" $p "* ]] || echo "the running kernel's command line lacks ${p} (SATA link power pin)"
   done
 }
 md_degraded_warn() {  # a mirror that lost a member shows an underscore inside [UU] (#1325); a warning, not a failure
@@ -643,7 +643,7 @@ phase1() {
   save_box_recipe   # before anything changes (#1310)
   save_root_keys
   if [[ ! -s "${STATE_DIR}/root-authorized_keys" && "${DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY:-}" != 1 ]]; then
-    die "no usable key in /root/.ssh/authorized_keys (blank, comments and command= lines do not count): root would have no way in after Proxmox replaces that file (#1283); add one, or set DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=1 to go on anyway"
+    die "no usable key in /root/.ssh/authorized_keys (blank, comments and command= lines do not count): root would have no way in after Proxmox replaces that file; add one, or set DEBIAN_TO_PVE_ALLOW_NO_ROOT_KEY=1 to go on anyway"
   fi
   keep_root_keys_outside_pve
   mkdir -p "${ROOT}/var/log/journal"; real systemd-tmpfiles --create --prefix /var/log/journal >>"$LOG_FILE" 2>&1 || true   # a freeze leaves a readable journal
@@ -752,7 +752,7 @@ write_network() {  # bridge over the uplink; detect from the default route, keep
   done
   if [[ -z "$ROOT" ]]; then   # best effort, no --now: the reboot applies it, a live stop could cut us off
     systemctl disable systemd-networkd systemd-networkd.socket systemd-networkd-wait-online >>"$LOG_FILE" 2>&1 || true
-    systemctl enable networking >>"$LOG_FILE" 2>&1 || warn "could not enable networking.service (#1237): vmbr0 may not come up on reboot"
+    systemctl enable networking >>"$LOG_FILE" 2>&1 || warn "could not enable networking.service: vmbr0 may not come up on reboot"
   fi
   write_resolv "$dns"
   verify_network "$cidr" "$gw" "$mac"
