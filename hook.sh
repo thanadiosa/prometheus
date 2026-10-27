@@ -1150,9 +1150,6 @@ fi
 [[ -n $auth_hint ]] && export PROVISIONER_HELPER_AUTH="$auth_hint" PROVISIONER_HELPER_AUTH_SRC="$auth_hint_src"
 export PROVISIONER_HELPER_AUTH_CACHE="${PROVISIONER_HELPER_AUTH_CACHE:-$HELPER_AUTH_CACHE}"
 export PROVISIONER_REMOTE_DIR="$_RD"
-. ./helper-lib.sh
-
-
 PREREPO_FINGERPRINTS=""
 _log_prerepo_fingerprints() {
   local f h out=""
@@ -1174,6 +1171,50 @@ _log_prerepo_fingerprints() {
   return 0
 }
 _log_prerepo_fingerprints
+
+HOOK_LIB_SHA256="ce05e6a7080f37d2fcc8bd0e8a0a3464c55f92ebcf89c33ece93ab929aad089e"
+HOOK_LIB_URL="${PROVISIONER_HOOK_LIB_URL:-https://raw.githubusercontent.com/thanadiosa/prometheus/main/helper-lib.sh}"
+hook_fetch_pinned_lib() {
+  local try tries d tmp url="$HOOK_LIB_URL"
+  [[ $url == https://* ]] && url+="?h=${HOOK_LIB_SHA256}"
+  d="$(umask 077; mktemp -d ./helper-lib.pin.XXXXXX)" || die "cannot make a scratch directory for the pinned helper-lib.sh"
+  tmp="${d}/lib"
+  tries="${PROVISIONER_HOOK_LIB_TRIES:-12}"
+  for ((try = 1; try <= tries; try++)); do
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --proto "${PROVISIONER_HOOK_LIB_PROTO:-=https}" --proto-redir '=https' --connect-timeout 15 --max-time 120 -o "$tmp" "$url" 2>/dev/null || : > "$tmp"
+    else
+      wget -q --https-only -T 60 -O "$tmp" "$url" 2>/dev/null || : > "$tmp"
+    fi
+    if [[ -s $tmp ]] && hook_lib_matches "$tmp"; then
+      mv -f "$tmp" ./helper-lib.sh; rm -rf "$d"
+      log "pinned helper-lib.sh (sha256/12 ${HOOK_LIB_SHA256:0:12}) fetched from the public mirror matches the hash baked into this hook"; return 0
+    fi
+    (( try < tries )) && sleep "${PROVISIONER_HOOK_LIB_RETRY_WAIT:-30}"
+  done
+  rm -rf "$d"
+  die "the helper-lib.sh served by the public mirror does not match the hash pinned in this hook (${HOOK_LIB_SHA256:0:12}) after ${tries} tries over several minutes. Was the code published within the last minutes? Run the one-liner again in five minutes. If it keeps failing, treat it as tampering and do not continue."
+}
+hook_lib_matches() {
+  local got
+  got="$(sha256sum "$1" 2>/dev/null)" && got="${got%% *}" || got=""
+  [[ $got == "$HOOK_LIB_SHA256" ]]
+}
+hook_select_lib() {
+  local here
+  if [[ -n $HOOK_LIB_SHA256 ]]; then hook_fetch_pinned_lib; return 0; fi
+  [[ -n ${BASH_SOURCE[0]:-} ]] && here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
+  if [[ -n $here && -s ${here}/helper-lib.sh && ! ${here}/helper-lib.sh -ef ./helper-lib.sh ]]; then
+    cp -f "${here}/helper-lib.sh" ./helper-lib.sh
+    log "helper-lib.sh is NOT hash-pinned: this hook carries no baked sha256 (a run from a checkout) - using the checkout's own ${here}/helper-lib.sh"
+    return 0
+  fi
+  log "helper-lib.sh is NOT hash-pinned: this hook carries no baked sha256 and no checkout sits beside it - sourcing the helper's copy unverified"
+}
+hook_select_lib
+. ./helper-lib.sh
+
+
 
 _hd_err="$(mktemp 2>/dev/null)" || _hd_err=/dev/null
 helper_detect 2>"$_hd_err"; _hd_rc=$?
