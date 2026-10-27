@@ -324,7 +324,20 @@ do_reboot() {
 }
 
 real() { if [[ -n "$ROOT" ]]; then log "probe root: skipping $1"; return 0; fi; "$@"; }   # fake-root guard
-apt_q() { [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }; DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
+# apt-get with the mirror's transient fetch errors absorbed (#1476): apt's own per-file retries, then a
+# bounded re-run of the whole step (a fresh `update` first) with a pause, each retry logged. A step that
+# still fails after the last attempt returns non-zero and the caller dies as before.
+APT_ATTEMPTS="${DEBIAN_TO_PVE_APT_ATTEMPTS:-3}"; APT_RETRY_PAUSE="${DEBIAN_TO_PVE_APT_PAUSE:-20}"
+apt_run() { DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=600 -o Acquire::Retries=5 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" >>"$LOG_FILE" 2>&1; }
+apt_q() {
+  [[ -n "$ROOT" ]] && { log "probe root: skipping apt-get $1"; return 0; }
+  local n=1
+  until apt_run "$@"; do
+    [[ $n -lt $APT_ATTEMPTS ]] || return 1
+    n=$((n+1)); log "apt-get $1 failed (attempt $((n-1)) of ${APT_ATTEMPTS}); retrying in ${APT_RETRY_PAUSE}s after a fresh update"
+    sleep "$APT_RETRY_PAUSE"; [[ $1 == update ]] || apt_run update || true
+  done
+}
 
 # -- grub-pc preseed (#1237) --------------------------------------------------------------
 # Proxmox's grub-pc replaces the cloud image's grub-cloud-amd64 and its postinst fails with an
