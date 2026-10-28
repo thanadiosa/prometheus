@@ -245,7 +245,7 @@ hook_crypt_store() {   # <password> <salt> [<scheme>] -> marker first, then the 
   ( umask 077; printf '%s\n%s\n' "$1" "$2" > "$t" ) && chmod 600 "$t" && mv -f "$t" "$HELPER_CRYPT_KEY" \
     || { rm -f "$t" "$HELPER_CRYPT_SCHEME_FILE"; return 1; }
 }
-HOOK_CRYPT_DERIVE_PY='import sys, hashlib, unicodedata
+HOOK_CRYPT_DERIVE_PY='import sys, hashlib, unicodedata  # noqa: E401 (hook.sh embeds this line verbatim)
 est = unicodedata.normalize("NFC", sys.argv[1] if len(sys.argv) > 1 else "")
 if not est or any(c in est for c in "|\r\n"):
     sys.exit(2)

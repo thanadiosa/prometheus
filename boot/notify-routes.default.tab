@@ -1,0 +1,380 @@
+# notify-routes.default.tab — the SPEC §16 event→route table (issue #103).
+#
+# THE ONE source of truth for the shipped default routing. bootstrap/notify.sh reads it
+# directly on the control node; ansible/roles/notify installs this same file on the PVE
+# host at /usr/local/lib/provisioner/notify-routes.default.tab. There is no second copy
+# of these defaults anywhere — change them here.
+#
+# ── FORMAT ────────────────────────────────────────────────────────────────────
+#   <event-glob>   <pushover: yes|no>   <priority: low|normal|high|emergency>   <once|->
+#
+# Whitespace-separated, `#` starts a comment, blank lines ignored.
+#
+# ── FIRST MATCH WINS — order IS the specificity rule ──────────────────────────
+# The table is an ORDERED list, not the mapping SPEC §16 first sketched: a mapping gives
+# no defensible precedence when two globs both match (`host.upgrade.failed` vs
+# `host.upgrade.*`). So put the specific line ABOVE its family, and keep `*` last.
+#
+# ── `once` — the false-success guard ──────────────────────────────────────────
+# `once` means "at most one send per notify SCOPE". run-pipeline.sh sets the scope to a
+# per-cold-start token that SURVIVES the PVE 8→9 upgrade's reboots, so `pipeline.done`
+# can physically fire only once across the three passes of a self-resuming cold start.
+# It is defence in depth: the primary guarantee is that `pipeline.done` is emitted only
+# at the true terminal milestone (see run-pipeline.sh main()).
+#
+# ── PER-ESTATE OVERRIDE ───────────────────────────────────────────────────────
+# Either stage a replacement `notify-routes.tab` on the helper under
+# the estate chroot's secrets/ (control-boot.sh pulls it to /etc/provisioner/notify-routes.tab),
+# or set the `notify_routes` list in the estate's group_vars/vault and let
+# ansible/roles/notify render it. Either wins over this file; neither is required.
+
+# ── Terminal outcomes: the two events worth waking up for ─────────────────────
+pipeline.failed        yes  high      -      # the estate died — #59's loud failure beacon
+pipeline.done          yes  normal    once   # THE success ping. Exactly one per cold start.
+
+# ── Host upgrade (SPEC §17) — emitted by the on-host state machine, at boot, with
+# no control node alive. `failed` is high: a half-upgraded hypervisor at 3am.
+host.upgrade.failed    yes  high      -
+host.upgrade.done      yes  normal    -
+host.upgrade.started   yes  low       -
+host.upgrade.*         no   normal    -      # prechecks/reboot-imminent/resumed: log-only
+
+# ── The needle (issue #103 scope extension) — the FIRST thing that can speak ──
+# Emitted from a bare PVE host with no repo and no control node. `detached` is the moment
+# the operator can walk away; `failed` is the only signal that exists at all if the needle
+# dies, because nothing downstream is alive yet to report it.
+host.needle.failed     yes  high      -
+host.needle.detached   yes  normal    -      # NOT `once`: the needle has no persisted scope,
+                                              # and it detaches exactly once per invocation.
+host.needle.seeded     yes  low       -      # PROGRESS (issue #195): both seed VMs are restored and
+                                              # the control node is being started. The one checkpoint
+                                              # inside the needle's phase worth a ping — the image
+                                              # pull is a multi-GB SFTP transfer and, until this
+                                              # fired, `detached` → `controller.started` was the
+                                              # longest silent window of the whole lap.
+host.needle.*          no   normal    -
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+controller.started     yes  low       once   # "the box is in control and driving" — ONCE, or a
+                                              # three-pass 8→9 cold start would ping three times
+                                              # and start training you to ignore the channel.
+pipeline.handoff       no   normal    -      # a pass handed off to the upgrade — NOT a success
+# ROUTED SINCE ISSUE #422, and the row above is why the two are not the same event. A
+# HAND-OFF is expected and self-healing (the §17 resume unit re-enters the pipeline after the
+# reboot, so nobody has to do anything). An INTERRUPTION is nobody's plan and NOTHING recovers
+# from it: the pass was killed — a host reboot, a Jenkins abort, an operator Ctrl-C — and the
+# build simply stopped. On 2026-09-02 that happened 43 minutes into a cold start, this event
+# was emitted log-only, and the estate sat half-built and silent for an hour while looking
+# healthy from outside. The message names the STAGE it died in (run-pipeline.sh's EXIT trap);
+# the estate rides the title, as on every row here.
+#
+# NORMAL, not high, and this is a judgement call worth stating. The commonest cause is a
+# DELIBERATE abort — someone stopped a Jenkins job — and a high-priority 3am push for a thing
+# the operator just did themselves is exactly how a channel gets muted (the same reasoning
+# validation.failed carries). `pipeline.failed` keeps the high ground. Raising this is a
+# one-word edit on this row if the deliberate-abort case ever stops being the common one.
+pipeline.interrupted   yes  normal    -      # the pass was KILLED — see pipeline.resumed below
+# THE OTHER HALF OF THAT PAIR (issue #435). Since the operator's 2026-09-03 decision on
+# issue #422 — report, notify AND resume — an interrupted lap ARMS a one-shot that re-enters
+# the pipeline when the control node comes back, in the same mode and action it died in.
+# This event is that pass announcing itself, before it does any work.
+#
+# LOW, and the pairing is the reason. `pipeline.interrupted` is the bad news and keeps
+# `normal`; this is the good news that follows it — the estate is fixing itself and there is
+# nothing to do. On Pushover `low` arrives without a sound: it is there in the list when the
+# operator looks, next to the interruption it answers, and the pass's own `pipeline.done` or
+# `pipeline.failed` (still `normal`/`high`) says how it ended. Routed rather than log-only
+# because an estate that silently re-enters a two-hour build is precisely the "different
+# estate to operate" the decision was held open over: if it restarts itself, it says so.
+#
+# NOT `once`, deliberately, and for the same reason as the progress rows: `once` latches on
+# the cold-start notify scope, which SURVIVES a failed lap — so a second interruption in the
+# same cold start would resume in complete silence, and that is the run being watched hardest.
+pipeline.resumed       yes  low       -      # the control node came back and is re-running the lap
+pipeline.started       no   normal    -
+pipeline.exit          no   normal    -      # a pass ended rc=0 without reaching the terminal
+
+# ── PROGRESS: the healthy-lap feed (issues #192 + #195) ───────────────────────
+# THE COMPLAINT THIS ANSWERS, in the operator's words: "only 3 notifications over an hour,
+# I have no idea what's happening". A cold start took ~an hour and pushed exactly three
+# times — needle detached, controller driving, estate up — so between minute 2 and minute
+# 58 a lap that was going PERFECTLY was indistinguishable from a lap that had wedged.
+#
+# These rows are the fix, and they are ALL about the SUCCESS path. The failure path was
+# never the gap: `pipeline.failed` (high) has covered it since #59. What was missing is the
+# ordinary "still going, here is where we are" ping, so every row below fires when a stage
+# has just SUCCEEDED — and each one's detail also names the stage starting next, which is
+# what turns a list of pings into a progress bar (see run-pipeline.sh main()).
+#
+# ONE PING PER STAGE TRANSITION — no finer. A full lap now costs the operator ~10 pushes
+# instead of 3, which is the whole budget: the next thing after "I can't see anything" is
+# "stop buzzing my phone", and §16 exists to keep this channel worth reading. In
+# particular the three golden templates get ONE summary ping between them, not one each
+# (they finish minutes apart and the per-template detail is already in the steps feed).
+#
+# LOW, deliberately. These are informational, and on Pushover `low` means it appears
+# without a sound — you look when you look. The two rows that are allowed to interrupt
+# you stay where they were: `pipeline.failed` (high) and `pipeline.done` (normal).
+# Raising one of these is a one-word edit on its row.
+#
+# NOT `once`, ALSO deliberately, and this is the row-for-row difference from
+# `controller.started` above. `once` is keyed on the cold-start notify scope, and that
+# scope deliberately SURVIVES a failed lap so the retry still yields one success ping
+# (run-pipeline.sh notify_scope()) — so a `once` progress row would make the RE-RUN of a
+# failed cold start completely silent, which is precisely the run the operator is watching
+# hardest. The cost of leaving it off is small and honest: on a three-pass 8→9 upgrade
+# cold start, `host.prep.done` pings on each pass, and that repetition is true — host-prep
+# really did run three times.
+#
+# THEY FIRE IN STEADY MODE TOO. Emission is unconditional (§16: call sites emit, the table
+# decides), so a Jenkins-driven steady apply gets the same progress feed. That is a
+# deliberate accept — an unattended 3am rebuild is exactly when it is wanted — and an
+# estate that disagrees overrides this table per-estate rather than patching code.
+host.prep.done         yes  low       -      # the PVE host is prepped; baking templates next
+host.bake.done         yes  low       -      # the golden templates are ready; router next (ONE
+                                              # summary row for server + opnsense-baked + desktop)
+# The rest of the progress family lives with its own subsystem, still ordered above that
+# subsystem's `*` line: opnsense.health.passed, vm.fleet.created, vm.fleet.provision.done
+# and validation.started, below.
+
+# The fleet upgrade's per-machine report (#1185): one push per update-fleet walk, machines
+# numbered and never named (the fleet's composition does not leave the node).
+fleet.upgrade.report   yes  normal    -
+
+# The restart job's one push (#1184): machines numbered, never named.
+fleet.reboot.report    yes  normal    -
+
+# ── Post-build validation (issue #123) — the lap's own user-POV checks ────────
+# `validation.failed` means the estate BUILT but does not behave the way a user expects.
+# NORMAL, not high: in the advisory posture the lap still succeeds, `pipeline.done` carries
+# the counts, and the checks are new enough that a 3am high-priority push over a fussy check
+# would train the operator to ignore the channel — the exact failure mode §16 is written to
+# avoid. Raise it here (one word) once the suite has earned it.
+#
+# "`pipeline.done` CARRIES THE COUNTS" WAS WRITTEN HERE LONG BEFORE IT WAS TRUE (issue #514).
+# The completion ping said "Estate is up. Lap took …" and nothing about the checks, so this
+# row was the only thing telling an operator that a check had gone red — two pushes for one
+# lap outcome, the second landing seconds before the message meant to summarise it. Since
+# #514 the completion really does carry "N passed, N failed, N skipped", and the stage emits
+# this event RECORD-ONLY on any lap that will reach a completion.
+#
+# THE ROW STAYS ROUTED, AND IT IS NOT DEAD. Two kinds of lap never reach a completion to
+# ride: the ENFORCING posture, where a red check ends the lap, and a §17 hand-off, where the
+# whole chain runs and the pass deliberately declines to call itself finished. On those the
+# announcement layer pushes this event itself, at the moment the ending is known, so a failed
+# verdict can never end up with no signal at all. Flipping this row to `no` would re-open
+# exactly that hole.
+validation.failed      yes  normal    -
+# `incomplete` is NOT a verdict and NOT a failure — the checks ABORTED on an infra fault before
+# producing one, and under the advisory posture that is fully contained: the lap succeeded and
+# nothing about the estate is known to be bad. LOG-ONLY on purpose (issue #288). `pipeline.done`
+# lands seconds later carrying the sentence that puts it in context — "the build succeeded, only
+# the post-build checks stopped early" — and it is the only ping that CAN say that, because it
+# is the only one emitted after the lap is over. Routed here as well, this row would buy the
+# operator two pushes for one outcome, which is exactly what happened on epimetheus 2026-08-21:
+# the same "no verdict" sentence twice, a minute apart. Kept as its OWN row rather than left to
+# fall through `validation.*` so that flipping the family row can never silently re-create the
+# duplicate; the call site also passes --record-only, so this row states the intent as much as
+# it enforces it. MUST stay above `validation.*` — first match wins.
+validation.incomplete  no   normal    -
+# `cleanup_failed` is NOT a verdict: the validation could not remove its own throwaway witness
+# VM, so a machine is left on the estate holding a services-tier address (issue #128). Routed
+# rather than log-only because it needs a HAND — one `qm destroy` — and the next lap's reap is a
+# safety net, not a fix. NORMAL for the same reason validation.failed is: it is not a 3am wake-up.
+validation.cleanup_failed yes normal  -
+# `started` is the PROGRESS row for the lap's last stage (issue #195): everything is built,
+# the estate is now being asked to prove it works. `done` stays LOG-ONLY on purpose — the
+# verdict rides pipeline.done, which lands seconds later with the same counts, and two pings
+# a minute apart saying the same thing is exactly the fragmentation #195's budget forbids.
+# (That claim was also ahead of the code until issue #514 — see the `validation.failed`
+# block above. The completion ping now carries the three counts on every lap that ran the
+# suite, which is what this row and that one have both promised all along.)
+validation.started     yes  low       -
+validation.*           no   normal    -      # done: log-only, the verdict rides pipeline.done
+
+# ── A commit just earned a "passed" mark on this estate (issue #1025, under #916/#915) ──
+# `autotest.passed` is emitted the one time `record_autotest_pass` (stages/validate.py)
+# actually writes the mark — never derived from a count or a log line read back later, for
+# the same borrowed-premise reason the mark itself refuses four other ways. It is NEWS, not
+# an approval: the wording says a version CAN be cut, and cutting one is still the Cut
+# version Jenkins job (#1023) the operator runs by hand. NORMAL, not high — a passed test
+# is not a 3am wake-up — and not `once`: each lap that writes a mark names its OWN commit,
+# so there is nothing here for a scope latch to be guarding against.
+autotest.passed        yes  normal    -
+
+# ── The router came up (or is about to come up) with no configuration (issue #125)
+# `opnsense.unconfigured` is the one the 2026-08-08 iapetus lap needed and did not have: the
+# router VM is being created with NO first-boot config ISO, so it will boot the bare baked
+# template — no VLANs, no addresses, no routing — and the whole lap is already lost. HIGH,
+# because it is emitted ~90 minutes before the failure it guarantees, and acting on it saves
+# every one of them. `health.failed` is the same estate seen a few minutes later from the
+# probe's side: NORMAL, not high — the gate's original design (SPEC §4.3) called for
+# bootstrap to proceed best-effort there, but a failed gate now ENDS the lap in both bootstrap
+# and steady state (operator decision 2026-08-08, issue #125; the bootstrap arm was the one
+# still best-effort until then), so `health.failed` fires seconds before the die and
+# `pipeline.failed` still owns the terminal beacon.
+opnsense.unconfigured  yes  high      -
+opnsense.health.failed yes  normal    -
+# The PROGRESS row for the router stage (issue #195), and the reason it is the health GATE
+# and not the tofu apply: "the router VM exists" is not a milestone anybody can act on —
+# #125 is the whole story of a router that existed and routed nothing. All three probe
+# layers green is the first moment the estate has a working gateway.
+opnsense.health.passed yes  low       -
+opnsense.*             no   normal    -      # seed.stale-state &c: log-only, it rides the steps feed
+
+# ── The cross-job state lock (issue #79) ─────────────────────────────────────
+# `state.lock.stale` means a previous job DIED holding the estate's apply lock and this run
+# took it over after the TTL. Routed rather than log-only because it is the one lock event
+# that says something happened that nobody saw: a job disappeared mid-apply, and whatever it
+# was doing to the fleet stopped half-done. NORMAL, not high — the takeover already un-wedged
+# the estate, so there is nothing to do at 3am; it is a "look at the previous lap" signal.
+# A BLOCKED run needs no route of its own: it dies, and pipeline.failed already carries it.
+state.lock.stale       yes  normal    -
+state.lock.*           no   normal    -
+
+# ── The fleet's two PROGRESS rows (issue #195) ───────────────────────────────
+# SPEC §16 asked for the VM paths to be over-instrumented now and routed log-only so that
+# "adding a coffee later is a one-line config edit, not a code change". This is that edit,
+# for exactly two of them — and they are the two that bracket the longest stage in the lap:
+# `vm.fleet.created` says the VMs exist and in-VM configuration (42 minutes on the
+# 2026-08-14 lap, the single window with the least visibility) is starting; the matching
+# `provision.done` says it finished. Everything else in the `vm.*` families stays log-only,
+# because a ping per VM is how you get taught to ignore the channel.
+# NOTE these two must stay ABOVE the family rows below them — first match wins.
+vm.fleet.created       yes  low       -
+vm.fleet.provision.done yes low       -
+
+# ── Over-instrumented families, routed log-only today (SPEC §16: "flip later is a
+# one-line CONFIG edit, not a code change").
+vm.*.created           no   normal    -
+vm.*.provision.*       no   normal    -
+vm.*                   no   normal    -
+
+# ── Pinned-version staleness (issue #6) — emitted by bootstrap/check-pins.sh ──
+# A WEEKLY REPORT, NEVER AN ACTION. The checker only reads: it compares the versions this
+# repo pins (docker/images.yaml, the rclone/player role defaults, genesis.sh's OPNsense
+# series) against each project's own upstream release feed and says what is behind. Nothing
+# is ever upgraded — everything we pin is pinned precisely so the operator picks the moment.
+#
+# `outdated` is NORMAL and NOT `once`. Normal because a stale pin is a this-week decision,
+# not a 3am wake-up (`pipeline.failed` keeps that ground); and emphatically NOT `once`,
+# because `once` latches per notify SCOPE and would turn the whole point of a recurring
+# report into a single lifetime ping — the second week's new release would be silent.
+# The checker already batches every stale pin into ONE message, so a busy week costs one
+# push, not one per project.
+maintenance.pin.outdated     yes  normal    -
+# `unreachable` means the checker established NOTHING this run — every upstream lookup
+# failed. Routed, at low, for the reason the `once` rows exist: a blind reporter that stays
+# silent is indistinguishable from a clean bill of health, and this channel's whole value is
+# that silence means "checked, nothing to do". Low because there is nothing to fix on the
+# estate — it is "the report you are expecting is not coming".
+maintenance.pin.unreachable  yes  low       -
+
+# ── Expiring credentials (issue #852, under #847) — emitted by the weekly
+# bootstrap/check-credentials.sh via bootstrap/credential_warn.py, one event PER
+# CREDENTIAL so that each has its own route, its own journal line and its own history.
+#
+# `dead` and `unusable` are HIGH, and they are the only maintenance rows that are: a
+# credential the issuing service has already REFUSED, or one that is staged and cannot be
+# used as written, is not a this-week decision like a stale pin — it is a thing that is
+# broken now and whose blast radius grows (a dead DNS token takes the router's certificate
+# with it about two months later, silently). `expiring` is NORMAL — there is by definition
+# still headroom, which is the whole point of warning ahead of the failure.
+#
+# ── NEITHER IS `once`, AND THAT IS THE LOAD-BEARING PART OF THIS BLOCK ────────
+# notify.sh's `once` latch is set on ATTEMPT, not on delivery (its step 2 comment says so,
+# and for `pipeline.done` that is right). Here it would be a lie: when the dead credential
+# IS the notification credential, the first week's send fails, the latch is set anyway, and
+# every following week reports `suppressed-duplicate` — silent, green, recorded as handled.
+# So credential_warn.py keeps its OWN latch, written only when notify.sh's journal confirms
+# the push was accepted, and re-sends every week until it actually travels. Adding `once`
+# to these rows re-opens exactly that hole; the warner detects it and turns the build red
+# rather than letting it be silent, but do not put it back.
+#
+# The anti-nag guarantee is still there and is stronger: one push per credential per
+# CALENDAR MONTH, and each message says so in its own last sentence.
+maintenance.credential.dead.*      yes  high      -
+maintenance.credential.expiring.*  yes  normal    -
+# `unusable` (#856): the credential is STAGED where it belongs and this node cannot use
+# what is there — an empty or half-written file, a key with no value, a directory where the
+# file should be. HIGH, with `dead`, and for the same reason: nothing is going to fix
+# itself, and if it is the notification credential then this row is what would have carried
+# the news. It is its own event rather than a second meaning for `dead` because no service
+# refused anything, and `dead`'s message says one did.
+maintenance.credential.unusable.*  yes  high      -
+# The blind run — the check reached NONE of the issuing services, so it knows nothing
+# about any credential and deliberately warns about none of them. Routed low for the same
+# reason maintenance.pin.unreachable is: a reporter that goes quiet when it is blind reads
+# exactly like a clean bill of health.
+maintenance.credential.unreachable yes  low       -
+# Anything else under this family is log-only — a new sub-event cannot start pushing
+# merely by being invented. MUST stay below the three rows above; first match wins.
+maintenance.credential.*           no   normal    -
+
+# ── Jenkins host-level self-update (issue #265) — emitted by the control node's
+# provisioner-jenkins-update.service, a systemd timer OUTSIDE the Jenkins container.
+# It rebuilds the derived image from the repo's pin at a per-estate quiet hour, recreates
+# the container ONLY if that image actually changed, health-checks it and rolls back on
+# failure. So these rows describe an unattended change to the CONTROL PLANE ITSELF, and
+# they are ordered by "how much of it is still working", not by how dramatic they sound.
+#
+# `failed` is the only one worth waking up for, and it is the narrowest: Jenkins answered
+# neither on the new image NOR after the rollback, i.e. the UI the operator would use to
+# investigate anything else is gone. HIGH.
+maintenance.jenkins.failed       yes  high      -
+# `rolled_back` means the net WORKED — the new image was unhealthy, the previous one is
+# back, Jenkins is serving. Nothing is broken at 3am; what is owed is a look at the pin
+# that produced the bad image before the next window. NORMAL, the same reasoning as
+# validation.failed: a high-priority push for a self-corrected fault is how this channel
+# gets muted.
+maintenance.jenkins.rolled_back  yes  normal    -
+# `build_failed` is the mildest bad outcome in the whole mechanism: the rebuild died, so
+# NOTHING was touched and the container is still serving the image it was serving a second
+# earlier. Routed anyway (not log-only) for the reason maintenance.pin.unreachable is: a
+# silent updater is indistinguishable from an updater that had nothing to do, and this
+# channel's value is that silence means "checked, nothing needed". NORMAL, not low,
+# because unlike the pin reporter this one is failing on THIS estate's own build.
+maintenance.jenkins.build_failed yes  normal    -
+# `updated` — the control plane was replaced under you last night and came back healthy.
+# LOW: informational, no sound, look when you look. It is genuinely rare (the usual
+# outcome is `current`, which sends nothing), so it is not push budget the operator will
+# resent — and being told "your Jenkins is not the one you left" is worth one silent line.
+maintenance.jenkins.updated      yes  low       -
+# `current` (nothing to do — no rebuild, no restart) and `deferred` (a pipeline was in
+# flight, so the window was skipped) fall through to the family row below and stay
+# LOG-ONLY. `current` is the nightly no-op and would be pure noise; `deferred` costs one
+# day and the next window retries it, so a push would be asking for attention nobody
+# needs to give.
+maintenance.*                no   normal    -      # pin.current &c: log-only — a weekly
+                                                    # "nothing to do" push is how a channel
+                                                    # gets muted.
+
+# ── The prometheus MCP server (issue #1014) — one call, one line ──────────────
+# `mcp.call` fires once per tool call the AI makes through the server (#1055: "every call
+# the MCP server makes... sends one plain Pushover line: which client, which job, which
+# build"). NORMAL, not low: unlike the lap's own progress rows above, this is the one
+# channel that says an AI touched the estate at all, so it stays audible rather than
+# silent-on-Pushover. NOT `once` — every call is its own event.
+cutversion.draft_ready   yes  normal    -      # a draft release is waiting for you to publish it (#1107)
+mcp.call                 yes  normal    -
+# `mcp.approval.pending` (#1053): a destructive job (restore/rebuild/coldstart) STARTED BY
+# THE MCP SERVER is paused on Jenkins's own `input` gate and needs the operator's Proceed/
+# Abort. HIGH — the one MCP event that is actually asking for a decision, and it is
+# time-bounded (Jenkinsfile.{restore,rebuild,coldstart} time out that input after an hour).
+mcp.approval.pending     yes  high      -
+# `approval.granted` (#1463): every approval of a destructive job's input step (cold start,
+# rebuild, restore, nested rebuild) pings once the approver has answered, naming job, build,
+# approver account and estate. HIGH: self-approval by the assistant is accepted (SPEC 6.7) and
+# this ping is its safeguard. Not `once`: every approval is its own event.
+approval.granted         yes  high      -
+
+# ── Signs-of-compromise check (issue #1057) — emitted by bootstrap/security_check.py ──
+# The job only sends this when it FOUND something present live and not declared, and it is
+# silent on a clean run, so every arrival is actionable. HIGH: a possible intrusion is the
+# thing a phone is for. Without this row the event fell to the `*` catch-all and the first
+# live run logged `route=log-only` -- an anomaly that paged nobody. NOT `once`: each daily
+# run that still finds drift should say so.
+security.anomaly.found yes  high      -
+
+# ── Catch-all: anything not named above is log-only. Keep this line LAST. ──────
+*                      no   normal    -
