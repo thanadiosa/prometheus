@@ -144,6 +144,13 @@ fleet.upgrade.report   yes  normal    -
 # The restart job's one push (#1184): machines numbered, never named.
 fleet.reboot.report    yes  normal    -
 
+# Planned reboots (#1488): one warning ~10 minutes ahead of the host's window or the fleet's
+# scheduled restart ("The host reboots at 18:30 (kernel update): every machine restarts"), and
+# one "reboot due" notice when an update asked for a reboot that waits for a later window. Both
+# are sent only when the reboot will really happen / is really waiting; neither carries an address.
+reboot.warning         yes  normal    -
+reboot.due             yes  normal    -
+
 # ── Post-build validation (issue #123) — the lap's own user-POV checks ────────
 # `validation.failed` means the estate BUILT but does not behave the way a user expects.
 # NORMAL, not high: in the advisory posture the lap still succeeds, `pipeline.done` carries
@@ -193,9 +200,10 @@ validation.started     yes  low       -
 validation.*           no   normal    -      # done: log-only, the verdict rides pipeline.done
 
 # ── A commit just earned a "passed" mark on this estate (issue #1025, under #916/#915) ──
-# `autotest.passed` is emitted the one time `record_autotest_pass` (stages/validate.py)
-# actually writes the mark — never derived from a count or a log line read back later, for
-# the same borrowed-premise reason the mark itself refuses four other ways. It is NEWS, not
+# `autotest.passed` is composed the one time `record_autotest_pass` (stages/validate.py)
+# actually writes the mark, and SENT at the run's clean ending (#1489: not when the checks
+# merely pass; a steady run gets a no-link "needs a cold start" sentence). Never derived from
+# a count or a log line read back later, for the same borrowed-premise reason the mark itself refuses four other ways. It is NEWS, not
 # an approval: the wording says a version CAN be cut, and cutting one is still the Cut
 # version Jenkins job (#1023) the operator runs by hand. NORMAL, not high — a passed test
 # is not a 3am wake-up — and not `once`: each lap that writes a mark names its OWN commit,
