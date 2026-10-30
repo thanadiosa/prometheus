@@ -211,6 +211,21 @@ if [[ -n $PROVISIONER_RESTORE_LEGACY_AGAIN && $PROVISIONER_RESTORE_LEGACY_AGAIN 
 fi
 [[ -n $PROVISIONER_RESTORE_LEGACY_AGAIN ]] && log "this run was asked to migrate again from the old system: ${PROVISIONER_RESTORE_LEGACY_AGAIN}"
 
+# ── #1504: "clear the pool a previous install left", for THIS run only ────────────────────
+# Same shape as the ask above: needle.sh writes a pool name (or `none`) into the snippet; it is
+# deleted just before the hand-off, so no later run and no seed baked from this node sees it.
+CLEAR_POOL_FILE="${STATE_DIR}/clear-old-pool"
+PROVISIONER_CLEAR_OLD_POOL="${PROVISIONER_CLEAR_OLD_POOL:-}"
+if [[ -z $PROVISIONER_CLEAR_OLD_POOL && -f $CLEAR_POOL_FILE ]]; then
+  PROVISIONER_CLEAR_OLD_POOL="$(head -n 1 "$CLEAR_POOL_FILE" | tr -d '[:space:]')"
+fi
+rm -f "$CLEAR_POOL_FILE"   # read once: the value lives in the environment from here, a retry or a seed never sees the file
+[[ $PROVISIONER_CLEAR_OLD_POOL == none ]] && PROVISIONER_CLEAR_OLD_POOL=""
+if [[ -n $PROVISIONER_CLEAR_OLD_POOL && ! $PROVISIONER_CLEAR_OLD_POOL =~ ^[A-Za-z][A-Za-z0-9_.:-]{0,63}$ ]]; then
+  die "$(printf 'the "clear the old pool" request %q is not usable: a plain pool name.' "$PROVISIONER_CLEAR_OLD_POOL")"
+fi
+[[ -n $PROVISIONER_CLEAR_OLD_POOL ]] && log "this run was asked to clear the pool a previous install left: ${PROVISIONER_CLEAR_OLD_POOL}"
+
 # ── Helper-fetch reliability: retry/backoff (review R3) ───────────────────────
 # Wraps this script's ONE required helper pull so the most fragile part of the cold start —
 # reaching the helper during the narrow first-boot window — SELF-HEALS against a transient
@@ -607,11 +622,13 @@ export PROVISIONER_REPO_COMMIT="$REPO_COMMIT"
 # Environment=, which is how the pin survives the reboot in the middle of a lap.
 export PROVISIONER_VERSION
 export PROVISIONER_RESTORE_LEGACY_AGAIN   # #1127: this run only
+export PROVISIONER_CLEAR_OLD_POOL         # #1504: this run only
 export PROVISIONER_REMOTE_DIR="$REMOTE_DIR"   # the helper layout needle threaded to us
 export PROVISIONER_HELPER="$helper"
 [[ -n $estate ]] && export PROVISIONER_ESTATE="$estate"   # WHICH estate to build (SPEC §14.6)
 
 rm -f "$LEGACY_AGAIN_FILE"   # #1127: consumed; the exported value carries it from here
+rm -f "$CLEAR_POOL_FILE"     # #1504: consumed likewise
 log "handing off to the checkout's control-init: ${CONTROL_INIT}"
 # shellcheck disable=SC2093 # deliberate: the die below is the exec-failed fallback, not dead code
 exec /bin/bash "$CONTROL_INIT"
