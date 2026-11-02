@@ -441,12 +441,13 @@ box_facts() {
   return 0
 }
 
-# The box recipe (#1310): the cloud-init user-data this box started from and its disk layout, kept
-# in the state folder BEFORE anything changes (the provider never gives either back). The
-# user-data can carry a hash or a token, so 0600 root. Never fails the conversion; a re-run that
-# finds the files leaves them.
+# The box recipe (#1310): the cloud-init user-data this box started from and the box's own record of
+# its disks, kept in the state folder BEFORE anything changes (the provider never gives either back).
+# The record is NOT the panel's disk layout, so it is named disks-after-install.json and stays on the
+# box (#1513); an older box's disk-layout.json holding it is renamed. The user-data can carry a hash
+# or a token, so 0600 root. Never fails the conversion; a re-run that finds the files leaves them.
 save_box_recipe() {
-  local ci="${STATE_DIR}/cloud-init.user-data" dl="${STATE_DIR}/disk-layout.json" src="" f
+  local ci="${STATE_DIR}/cloud-init.user-data" dl="${STATE_DIR}/disks-after-install.json" old="${STATE_DIR}/disk-layout.json" src="" f
   if [[ -s $ci ]]; then log "box recipe: cloud-init copy already kept"
   else
     for f in "${ROOT}/var/lib/cloud/instance/user-data.txt" $(ls -t "${ROOT}"/var/lib/cloud/instances/*/user-data.txt 2>/dev/null); do
@@ -455,8 +456,9 @@ save_box_recipe() {
     if [[ -n $src ]] && ( umask 077; cp "$src" "$ci" ) 2>/dev/null; then chmod 0600 "$ci"; log "box recipe: kept the cloud-init user-data"
     else rm -f "$ci"; warn "box recipe: no cloud-init user-data copy found, skipped"; fi
   fi
-  if [[ -s $dl ]]; then log "box recipe: disk layout already kept"; return 0; fi
-  if ! command -v python3 >/dev/null 2>&1; then warn "box recipe: no python3, disk layout skipped"; return 0; fi
+  if [[ ! -e $dl && -s $old ]] && grep -q '"lsblk"' "$old" 2>/dev/null; then mv "$old" "$dl" && log "box recipe: old disk record renamed to ${dl##*/}"; fi   # #1513
+  if [[ -s $dl ]]; then log "box recipe: disk record already kept"; return 0; fi
+  if ! command -v python3 >/dev/null 2>&1; then warn "box recipe: no python3, disk record skipped"; return 0; fi
   ( umask 077; ROOT="$ROOT" python3 - "$dl" <<'PY'
 import json, os, subprocess, sys, datetime
 root = os.environ.get("ROOT", "")
@@ -488,7 +490,7 @@ with open(sys.argv[1] + ".tmp", "w") as fh:
     json.dump(doc, fh, indent=1)
 os.replace(sys.argv[1] + ".tmp", sys.argv[1])
 PY
-  ) 2>>"$LOG_FILE" && log "box recipe: kept the disk layout" || { rm -f "$dl" "$dl.tmp"; warn "box recipe: disk layout could not be written, skipped"; }
+  ) 2>>"$LOG_FILE" && log "box recipe: kept the disk record" || { rm -f "$dl" "$dl.tmp"; warn "box recipe: disk record could not be written, skipped"; }
   return 0
 }
 
