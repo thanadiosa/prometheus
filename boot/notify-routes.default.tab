@@ -343,11 +343,20 @@ maintenance.jenkins.rolled_back  yes  normal    -
 # channel's value is that silence means "checked, nothing needed". NORMAL, not low,
 # because unlike the pin reporter this one is failing on THIS estate's own build.
 maintenance.jenkins.build_failed yes  normal    -
+# ── Player mounts: the player's container cannot read a folder it binds ───────
+# Sent by the control node's player-mount watch after two failed checks in a row, once per outage.
+# HIGH: files look missing in the player until someone acts. `recovered` is the all-clear.
+# `watch_blind` is the watch itself going deaf (no usable answer for many checks in a row, or the
+# watch cannot run at all): HIGH, since a silent watch looks the same as a healthy estate.
+player.mount.failed          yes  high      -
+player.mount.recovered       yes  normal    -
+player.mount.watch_blind     yes  high      -
+player.mount.watch_seen      yes  normal    -
 # `updated` — the control plane was replaced under you last night and came back healthy.
 # LOW: informational, no sound, look when you look. It is genuinely rare (the usual
 # outcome is `current`, which sends nothing), so it is not push budget the operator will
 # resent — and being told "your Jenkins is not the one you left" is worth one silent line.
-maintenance.jenkins.updated      yes  low       -
+maintenance.jenkins.updated     yes  low       -
 # `current` (nothing to do — no rebuild, no restart) and `deferred` (a pipeline was in
 # flight, so the window was skipped) fall through to the family row below and stay
 # LOG-ONLY. `current` is the nightly no-op and would be pure noise; `deferred` costs one
