@@ -151,6 +151,11 @@ fleet.reboot.report    yes  normal    -
 reboot.warning         yes  normal    -
 reboot.due             yes  normal    -
 
+# The scheduled backup's old-copy alarm (#1548): a machine whose items are saved by its own night
+# job has one that is older than the limit (default 30 h) or cannot be read. NORMAL: a missed night
+# is worth a push, not a wake-up. Counts and item names only, no machine name.
+backup.night.old       yes  normal    -
+
 # ── Post-build validation (issue #123) — the lap's own user-POV checks ────────
 # `validation.failed` means the estate BUILT but does not behave the way a user expects.
 # NORMAL, not high: in the advisory posture the lap still succeeds, `pipeline.done` carries
