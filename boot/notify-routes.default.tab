@@ -398,5 +398,15 @@ approval.granted         yes  high      -
 # run that still finds drift should say so.
 security.anomaly.found yes  high      -
 
+# ── A failed job on the job server (issue #1554) ──────────────────────────────
+# bootstrap/job-failed-alert.sh, called from a job's `post { failure }`: the job's name, build
+# number and link, nothing else. HIGH: a job that failed unattended is what a phone is for.
+job.failed             yes  high      -
+
+# ── The test gate's first red (issue #1572) ───────────────────────────────────
+# tests/run_all.sh, once per run: "Gate <sha>: first red <suite> after <m> min". HIGH: the gate runs for
+# hours and the first red used to be seen only at the verdict.
+tests.gate.first_red   yes  high      -
+
 # ── Catch-all: anything not named above is log-only. Keep this line LAST. ──────
 *                      no   normal    -
