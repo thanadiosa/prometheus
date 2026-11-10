@@ -282,6 +282,11 @@ maintenance.pin.outdated     yes  normal    -
 # that silence means "checked, nothing to do". Low because there is nothing to fix on the
 # estate — it is "the report you are expecting is not coming".
 maintenance.pin.unreachable  yes  low       -
+# `security` (#1566): a published security warning has sat on a pinned version for more than 7 days.
+# HIGH and NOT `once` -- it repeats each week until the warning is gone, which `once` (a lifetime
+# latch) would forbid. `maintenance.pin.behind` (pins behind, none past its limit) is log-only
+# via the `maintenance.*` row at the end.
+maintenance.pin.security     yes  high      -
 
 # ── Expiring credentials (issue #852, under #847) — emitted by the weekly
 # bootstrap/check-credentials.sh via bootstrap/credential_warn.py, one event PER
@@ -348,6 +353,14 @@ maintenance.jenkins.rolled_back  yes  normal    -
 # channel's value is that silence means "checked, nothing needed". NORMAL, not low,
 # because unlike the pin reporter this one is failing on THIS estate's own build.
 maintenance.jenkins.build_failed yes  normal    -
+# `login_failed` (issue #1570) -- the small job that logs in to the machines a job may use,
+# started right after each update, could not. Nothing was rolled back; the phone is the whole
+# point, because without it the first job to need the login is the one that finds out. NORMAL.
+maintenance.jenkins.login_failed yes  normal    -
+# `hold_stuck` (issue #1570) -- the release hold could not decide and kept an estate on its current
+# commit. Nothing is broken, the estate just does not move; LOW, and sync-checkout sends it at most
+# once per estate per 24 hours. Above the maintenance.* family row so the first match is the push.
+maintenance.release.hold_stuck yes  low       -
 # ── Player mounts: the player's container cannot read a folder it binds ───────
 # Sent by the control node's player-mount watch after two failed checks in a row, once per outage.
 # HIGH: files look missing in the player until someone acts. `recovered` is the all-clear.
