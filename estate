@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+# estate - the operator's laptop command (issue #1592, part #1593).
+#   estate init <zone>        once: remember the DNS zone (the only thing stored)
+#   estate <name> status      the box, the control node, the job server: each answers or not
+#   estate version            say whether the public mirror holds a newer copy of this file
+#   estate <name> mount [dir] [--rw]   the seedbox folder as a folder (read-only unless --rw)
+#   estate <name> umount              undo it
+#   estate <name> fetch <container> [dest]   the four folders of a development container, into a dated folder
+#   estate <name> push <container> [src]     a fetched set into that container (the mover asks for a typed yes)
+#   estate <name> build [--go|--follow]      the cold start of a freshly installed box; dry run unless --go
+#
+# The box, the control node and the development server come from your own ~/.ssh/config (entries
+# `Host <name>-box`, `-control` and `-dev`, read with `ssh -G`). sshush writes them from the estate's access
+# file (`access/ssh-config.yml` in the seedbox folder: `sshush --source ~/.ssh/config.yml`); every other name,
+# port and account from the estate's public DNS records, asked of the zone's own name servers. Nothing about an estate is in this file.
+# Secrets come only from the laptop's keyring (Linux secret-tool, macOS security) or an ssh
+# agent, never from argv or a file. Needs ssh (+ssh-keyscan), curl and dig (mount: rclone and FUSE); bash 3.2 is
+# enough, so it runs on a stock macOS.
+# Install or update: curl -fsSL <mirror>/estate -o ~/bin/estate && chmod +x ~/bin/estate
+ESTATE_REV=2026110909
+set -uo pipefail
+export LC_ALL=C   # the name and address checks use plain ASCII ranges
+for v in ${!RCLONE_*}; do unset "$v"; done   # no inherited rclone log or dump switch can write the settings out
+
+MIRROR_URL="${ESTATE_MIRROR_URL:-https://raw.githubusercontent.com/thanadiosa/prometheus/main/estate}"
+CFG_DIR="${ESTATE_CONFIG_DIR:-$HOME/.config/estate}"
+
+die() { printf 'estate: %s\n' "$*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  printf '%s\n' 'usage: estate init <zone>' '       estate <name> status' '       estate <name> mount [dir] [--rw]' '       estate <name> umount' '       estate <name> fetch <container> [dest]' '       estate <name> push <container> [src]' '       estate <name> build [--go|--follow]' '       estate version' >&2
+  exit 2
+}
+
+# The mirror's copy carries a larger ESTATE_REV when it is newer. Said, never acted on.
+# rc 1 = the mirror could not be read.
+mirror_notice() {
+  local theirs
+  have curl || return 1
+  theirs="$(curl -fsS --max-time 5 "$MIRROR_URL" 2>/dev/null | sed -n 's/^ESTATE_REV=\([0-9][0-9]*\).*/\1/p' | sed -n 1p)"
+  [ -n "$theirs" ] || return 1
+  if [ "$theirs" -gt "$ESTATE_REV" ]; then
+    printf 'note: the public mirror holds a newer copy of estate (%s, yours is %s); fetch it again from %s\n' "$theirs" "$ESTATE_REV" "$MIRROR_URL" >&2
+  fi
+  return 0
+}
+
+cmd_version() {
+  printf 'estate %s\n' "$ESTATE_REV"
+  mirror_notice || printf 'note: could not read the public mirror to compare\n' >&2
+}
+
+cmd_init() {
+  local zone="${1:-}"
+  [ -n "$zone" ] || die "init needs the zone, e.g.: estate init <zone>"
+  case "$zone" in *[!A-Za-z0-9.-]*|.*|*.|-*|*..*) die "'$zone' does not look like a DNS zone" ;; esac
+  case "$zone" in *.*) ;; *) die "'$zone' does not look like a DNS zone (no dot)" ;; esac
+  ( umask 077; mkdir -p "$CFG_DIR" && printf 'zone=%s\n' "$zone" > "$CFG_DIR/config" ) \
+    || die "could not write $CFG_DIR/config"
+  printf 'zone stored in %s/config\n' "$CFG_DIR"
+}
+
+ZONE=""
+load_zone() {
+  [ -f "$CFG_DIR/config" ] || die "no zone is set; run once: estate init <zone>"
+  ZONE="$(sed -n 's/^zone=//p' "$CFG_DIR/config" | sed -n 1p)"
+  [ -n "$ZONE" ] || die "$CFG_DIR/config holds no zone; run: estate init <zone>"
+}
+
+# dns_ask <type> <name>: the answer lands in DNS_OUT (never a subshell, so the flags stick).
+# rc 0 = a server answered (empty = the record does not exist), rc 1 = nobody answered.
+# The zone's own name servers first; the system resolver only last, and then DNS_UNVERIFIED.
+DNS_OUT=""
+DNS_UNVERIFIED=0
+NS_LIST=""
+dns_ask() {
+  local type="$1" name="$2" ns
+  DNS_OUT=""
+  if [ -z "$NS_LIST" ]; then
+    NS_LIST="$(dig +short +time=3 +tries=2 NS "$ZONE" 2>/dev/null | sed 's/\.$//' | grep -v '^$' | tr '\n' ' ')"
+    [ -n "$NS_LIST" ] || NS_LIST="-"
+  fi
+  for ns in $NS_LIST; do
+    [ "$ns" = "-" ] && break
+    DNS_OUT="$(dig +short +time=3 +tries=1 "@${ns}" "$type" "$name" 2>/dev/null)" && return 0
+  done
+  DNS_OUT="$(dig +short +time=3 +tries=2 "$type" "$name" 2>/dev/null)" && { DNS_UNVERIFIED=1; return 0; }
+  DNS_OUT=""
+  return 1
+}
+
+# The first IPv4 address of a name, in DNS_A (kept in memory only, never printed).
+DNS_A=""
+dns_a() {
+  dns_ask A "$1"
+  DNS_A="$(printf '%s\n' "$DNS_OUT" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sed -n 1p)"
+  [ -n "$DNS_A" ]
+}
+
+# keyring_get <entry>: the secret on stdout; rc 2 = no keyring tool, 1 = no such entry.
+# The entry name is an attribute, not a secret; the secret itself never touches argv.
+keyring_get() {
+  if have secret-tool; then secret-tool lookup service estate account "$1" 2>/dev/null | grep .
+  elif have security; then security find-generic-password -s estate -a "$1" -w 2>/dev/null | grep .
+  else return 2
+  fi
+}
+
+# cfg_word <keyword> [<alias>]: rc 0 when ~/.ssh/config ITSELF has a <keyword> line (with <alias>: one whose
+# patterns include exactly that name; a wildcard or a negated `!name` does not count). Includes are not followed.
+cfg_word() {
+  [ -f "${HOME}/.ssh/config" ] || return 1
+  awk -v k="$1" -v a="${2:-}" '{ n = split($0, w, /[ \t=]+/); i = (w[1] == "") ? 2 : 1
+      if (tolower(w[i]) != k) next
+      if (a == "") { f = 1; next }
+      if (index($0, "\"") || $0 ~ /[ \t=]!/) next   # quoted or negated patterns: ssh may not match; never count them
+      for (i = i + 1; i <= n; i++) { p = w[i]; if (p ~ /^#/) break; if (p == a) f = 1 } }
+    END { exit f ? 0 : 1 }' "${HOME}/.ssh/config"
+}
+
+g_val() { printf '%s\n' "$1" | sed -n "s/^$2 //p" | sed -n 1p; }   # <ssh -G output> <key>: its first value
+
+# ssh_entry <alias>: the laptop's own ~/.ssh/config entry, read by `ssh -G` (no connection, no shell) into
+# SSH_HOST SSH_PORT SSH_USER (SSH_G = the whole answer). rc 1 = no such entry, rc 3 = a host name or port that is
+# not plain, rc 4 = ssh -G failed (a broken ~/.ssh/config), rc 5 = not in ~/.ssh/config itself, which has Includes.
+# Estate names are lower-case only (checked before any verb), so the alias needs no lowering.
+SSH_HOST=""; SSH_PORT=""; SSH_USER=""; SSH_G=""
+ssh_entry() {
+  local alias="$1"
+  SSH_HOST=""; SSH_PORT=""; SSH_USER=""; SSH_G=""
+  SSH_G="$(ssh -G -- "$alias" 2>/dev/null)" || return 4
+  SSH_HOST="$(g_val "$SSH_G" hostname)"; SSH_PORT="$(g_val "$SSH_G" port)"; SSH_USER="$(g_val "$SSH_G" user)"
+  [ -n "$SSH_HOST" ] || return 1
+  [ "$(printf '%s' "$SSH_HOST" | tr 'A-Z' 'a-z')" != "$alias" ] || return 1
+  # a `Host *` with a HostName makes every name look defined: a Host line must name the alias itself
+  if ! cfg_word host "$alias"; then cfg_word include && return 5; return 1; fi
+  case "$SSH_HOST" in -*|.*|*[!A-Za-z0-9.:-]*) return 3 ;; esac
+  case "$SSH_PORT" in ''|*[!0-9]*) return 3 ;; esac
+  return 0
+}
+
+# ssh_unsafe <ssh -G output>: rc 0 when a setting would make ssh check another key, key file or path than the
+# pinned-key check did; the setting is named in UNSAFE.
+UNSAFE=""
+ssh_unsafe() {
+  local kh="${HOME}/.ssh/known_hosts" v
+  UNSAFE=""
+  [ -z "$(g_val "$1" hostkeyalias)" ] || { UNSAFE=HostKeyAlias; return 0; }
+  v="$(g_val "$1" userknownhostsfile)"
+  case "$v" in "$kh"|"$kh ${kh}2") ;; *) UNSAFE=UserKnownHostsFile; return 0 ;; esac
+  case "$(g_val "$1" proxyjump)" in ''|none) ;; *) UNSAFE=ProxyJump; return 0 ;; esac
+  case "$(g_val "$1" proxycommand)" in ''|none) ;; *) UNSAFE=ProxyCommand; return 0 ;; esac
+  case "$(g_val "$1" stricthostkeychecking)" in no|false|off|accept-new) UNSAFE=StrictHostKeyChecking; return 0 ;; esac
+  case "$(g_val "$1" knownhostscommand)" in ''|none) ;; *) UNSAFE=KnownHostsCommand; return 0 ;; esac
+  case "$(g_val "$1" verifyhostkeydns)" in yes|true|ask) UNSAFE=VerifyHostKeyDNS; return 0 ;; esac
+  return 1
+}
+
+# need_ssh_entry <alias> <what>: ssh_entry, or die saying the entry comes from the access file via sshush.
+need_ssh_entry() {
+  ssh_entry "$1"
+  case $? in
+    0) return 0 ;;
+    3) die "the entry Host $1 in your ~/.ssh/config has a HostName or Port that is not a plain name or number; nothing was sent" ;;
+    4) die "ssh -G could not read your ~/.ssh/config (try: ssh -G $1); nothing was sent" ;;
+    5) die "no Host $1 line in ~/.ssh/config itself; it has Include lines, which estate does not follow. Put the Host $1 entry in ~/.ssh/config; nothing was sent" ;;
+  esac
+  die "your ~/.ssh/config has no Host $1 entry, so the $2 is not known; nothing was sent. The entry comes from the estate's access file: copy access/ssh-config.yml from the seedbox folder into ~/.ssh/config.yml and run: sshush --source ~/.ssh/config.yml"
+}
+
+# Each probe prints the one status line for its machine.
+# The box and the control node: where the `Host <name>-box` / `Host <name>-control` entry of ~/.ssh/config points
+# (sshush writes both from the access file), never a DNS record. It only reads `ssh -G` and keyscans; a verb that
+# CONNECTS to one of these must first run ssh_unsafe and need_pinned_key and use the forced -o list, as build does.
+probe_entry() {   # <label> <alias>
+  local label="$1" alias="$2" keys
+  ssh_entry "$alias"
+  case $? in
+    0) ;;
+    3) printf '%s: unknown - the entry Host %s in your ~/.ssh/config has a HostName or Port that is not plain\n' "$label" "$alias"; return 1 ;;
+    4) printf '%s: unknown - ssh -G could not read your ~/.ssh/config\n' "$label"; return 1 ;;
+    5) printf '%s: unknown - no Host %s line in ~/.ssh/config itself (estate does not follow its Include lines)\n' "$label" "$alias"; return 1 ;;
+    *) printf '%s: unknown - your ~/.ssh/config has no Host %s entry (it comes from the estate access file access/ssh-config.yml: sshush --source ~/.ssh/config.yml)\n' "$label" "$alias"; return 1 ;;
+  esac
+  keys="$(ssh-keyscan -T 5 -p "$SSH_PORT" "$SSH_HOST" 2>/dev/null)"
+  if [ -n "$keys" ]; then printf '%s: answers (%s, ssh port %s)\n' "$label" "$SSH_HOST" "$SSH_PORT"; return 0; fi
+  printf '%s: no answer (%s, ssh port %s)\n' "$label" "$SSH_HOST" "$SSH_PORT"; return 1
+}
+
+# The address comes from unauthenticated DNS, so it is checked BEFORE any secret is read:
+# https only, a plain host name inside the zone, no userinfo, no odd characters.
+jenkins_url_ok() {   # <url> -> 0 when it may be contacted and may carry a login
+  local url="$1" rest host
+  case "$url" in https://*) ;; *) return 1 ;; esac
+  case "$url" in *[!A-Za-z0-9:/._?#%=\&+~-]*) return 1 ;; esac
+  rest="${url#*://}"; host="${rest%%[/?#]*}"
+  case "$host" in *:*) case "${host##*:}" in ''|*[!0-9]*) return 1 ;; esac; host="${host%:*}" ;; esac
+  case "$host" in ''|*[!a-z0-9.-]*|.*|*..*) return 1 ;; esac
+  case "$host" in *".${ZONE}") return 0 ;; esac
+  return 1
+}
+
+# The keyring value must be one line, user:token, no control characters (a newline would
+# add lines to curl's stdin config).
+keyring_value_ok() {   # <value>
+  case "$1" in *$'\n'*|*[[:cntrl:]]*) return 1 ;; esac
+  case "$1" in ?*:?*) return 0 ;; esac
+  return 1
+}
+
+probe_jenkins() {   # <estate> <url>
+  local name="$1" url="$2" code="" secret="" rc=1 raw note=""
+  jenkins_url_ok "$url" || { printf 'job server: unknown - the jenkins= address in the DNS record is not an https address inside the zone, so it was not contacted\n'; return 1; }
+  if [ "$DNS_UNVERIFIED" != 0 ]; then
+    note="not signed in: the records came from your resolver and are not trusted with a login"
+  else
+    raw="$(keyring_get "${name}-jenkins")"; rc=$?
+    if [ "$rc" = 0 ]; then
+      if keyring_value_ok "$raw"; then secret="$raw"
+      else rc=3; fi
+    fi
+  fi
+  if [ -n "$secret" ]; then
+    # the secret goes through curl's stdin config, never argv
+    code="$(printf 'user = "%s"\n' "$(printf '%s' "$secret" | sed 's/[\\"]/\\&/g')" \
+            | curl -sS -g --proto =https --proto-redir =https -K - -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null)"
+  else
+    code="$(curl -sS -g --proto =https --proto-redir =https -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null)"
+  fi
+  case "$code" in
+    ""|000) printf 'job server: no answer (%s)\n' "$url"; return 1 ;;
+  esac
+  if [ -n "$secret" ]; then
+    case "$code" in
+      2??|3??) printf 'job server: answers, signed in (%s)\n' "$url" ;;
+      *)       printf 'job server: answers, but the keyring entry %s-jenkins was refused (%s)\n' "$name" "$url" ;;
+    esac
+  elif [ -n "$note" ]; then printf 'job server: answers, %s (%s)\n' "$note" "$url"
+  elif [ "$rc" = 3 ]; then printf 'job server: answers, not signed in: keyring entry %s-jenkins is not a single user:token line (%s)\n' "$name" "$url"
+  elif [ "$rc" = 2 ]; then
+    printf 'job server: answers, not signed in: no keyring tool (secret-tool or macOS security) (%s)\n' "$url"
+  else
+    printf 'job server: answers, not signed in: no keyring entry %s-jenkins (%s)\n' "$name" "$url"
+  fi
+  return 0
+}
+
+cmd_status() {
+  local name="$1" txt jenkins_url="" kv bad=0 rec
+  have dig || die "dig is not installed (it reads the estate's DNS records)"
+  have ssh || die "ssh is not installed"
+  have ssh-keyscan || die "ssh-keyscan is not installed (it comes with ssh)"
+  have curl || die "curl is not installed"
+  load_zone
+  rec="_estate.${name}.${ZONE}"
+  dns_ask TXT "$rec"
+  txt="$(printf '%s' "$DNS_OUT" | tr -d '"')"
+  for kv in $txt; do
+    case "$kv" in
+      jenkins=*) jenkins_url="${kv#jenkins=}" ;;
+    esac
+  done
+  [ "$DNS_UNVERIFIED" = 0 ] || printf "note: the zone's own name servers did not answer; these records came from your resolver and may be stale\n" >&2
+  probe_entry box "${name}-box" || bad=1
+  probe_entry 'control node' "${name}-control" || bad=1
+  if [ -z "$txt" ]; then
+    printf 'job server: unknown - the DNS record %s (TXT) is missing, so no address is known\n' "$rec"
+    bad=1
+  elif [ -z "$jenkins_url" ]; then printf 'job server: unknown - the record %s has no jenkins=<address> entry\n' "$rec"; bad=1
+  else probe_jenkins "$name" "$jenkins_url" || bad=1; fi
+  mirror_notice
+  return "$bad"
+}
+
+# ---- mount / umount (issue #1594) ----
+# The estate's seedbox folder (access folder, backups, step feed) appears as a plain folder on the laptop, through rclone.
+# Where and as whom: the estate's DNS (helper.<name> A, _helper.<name> TXT user= port= dir= crypt=). The login and the folder
+# key: the laptop's keyring only. rclone gets its settings in ITS ENVIRONMENT (RCLONE_CONFIG_*), set inside a subshell that
+# execs rclone: no config file, nothing on any command line (`ps` shows only the fixed words), and the keys exist only as
+# the obscured values rclone itself needs. The seedbox host key must already be pinned in ~/.ssh/known_hosts; it is never
+# accepted blind. Read-only unless --rw.
+SFTP_R="ESTATESFTP"; CRYPT_R="ESTATECRYPT"   # env-safe remote names (estate names carry '-')
+
+mount_default_dir() { printf '%s/mnt/estate/%s' "$HOME" "$1"; }
+mount_state_file() { printf '%s/mount.%s' "$CFG_DIR" "$1"; }
+# mounted_at <dir>: rc 0 when `mount` lists something there (both Linux and macOS print "src on <dir> ...").
+mounted_at() { mount 2>/dev/null | grep -F " on ${1} " >/dev/null; }
+mount_abs() { case "$1" in /*) printf '%s' "${1%/}" ;; *) printf '%s/%s' "$(pwd)" "${1%/}" ;; esac; }
+
+# rclone_env <rclone args...>: runs rclone with the settings in a subshell's environment (never `env VAR=...`: that is argv).
+# Reads host user port kh algs crypt rdir OB_PASS OB_KEY OB_SALT from cmd_mount.
+rclone_env() {
+  (
+    export "RCLONE_CONFIG_${SFTP_R}_TYPE=sftp" "RCLONE_CONFIG_${SFTP_R}_HOST=$host" "RCLONE_CONFIG_${SFTP_R}_USER=$user" \
+           "RCLONE_CONFIG_${SFTP_R}_PORT=$port" "RCLONE_CONFIG_${SFTP_R}_KNOWN_HOSTS_FILE=$kh" \
+           "RCLONE_CONFIG_${SFTP_R}_CIPHERS=aes128-ctr" "RCLONE_CONFIG_${SFTP_R}_MACS=hmac-sha2-256" \
+           "RCLONE_CONFIG_${SFTP_R}_SET_MODTIME=false" "RCLONE_CONFIG_${SFTP_R}_DISABLE_HASHCHECK=true"
+    [ -z "$algs" ] || export "RCLONE_CONFIG_${SFTP_R}_HOST_KEY_ALGORITHMS=$algs"
+    export "RCLONE_CONFIG_${SFTP_R}_PASS=$OB_PASS"
+    if [ "$crypt" = 1 ]; then
+      export "RCLONE_CONFIG_${CRYPT_R}_TYPE=crypt" "RCLONE_CONFIG_${CRYPT_R}_REMOTE=${SFTP_R}:${rdir}" \
+             "RCLONE_CONFIG_${CRYPT_R}_FILENAME_ENCRYPTION=standard" "RCLONE_CONFIG_${CRYPT_R}_DIRECTORY_NAME_ENCRYPTION=true" \
+             "RCLONE_CONFIG_${CRYPT_R}_PASSWORD=$OB_KEY" "RCLONE_CONFIG_${CRYPT_R}_PASSWORD2=$OB_SALT"
+    fi
+    exec rclone --config /dev/null "$@"
+  )
+}
+
+cmd_mount() {
+  local name="$1"; shift
+  local dir="" rw=0 a txt kv user="" port="" rdir="" crypt=0 host spec kh algs="" t login lpw luser key fpw="" fsalt="" rc ml top rec
+  for a in "$@"; do
+    case "$a" in
+      --rw) rw=1 ;;
+      -*) die "unknown flag '$a' (mount takes [dir] and --rw)" ;;
+      *) [ -z "$dir" ] || die "mount takes one folder"; dir="$a" ;;
+    esac
+  done
+  have dig || die "dig is not installed (it reads the estate's DNS records)"
+  have rclone || die "rclone is not installed (get it from the rclone web site)"
+  have ssh-keygen || die "ssh-keygen is not installed (it comes with ssh)"
+  if [ "$(uname -s)" = Darwin ]; then
+    { [ -d /Library/Filesystems/macfuse.fs ] || [ -d /Library/Filesystems/fuse-t.fs ] || ls /usr/local/lib/libfuse*.dylib >/dev/null 2>&1; } \
+      || die "no FUSE on this Mac: install macFUSE (brew install --cask macfuse), allow it in System Settings, reboot"
+  else
+    { have fusermount3 || have fusermount; } || die "no FUSE on this machine: install your distribution's fuse3 package"
+  fi
+  load_zone
+  [ -n "${HOME:-}" ] || die "HOME is not set"
+  [ -n "$dir" ] || dir="$(mount_default_dir "$name")"
+  dir="$(mount_abs "$dir")"
+  case "$dir" in *[[:cntrl:]]*) die "the folder name has a control character" ;; esac
+  if mounted_at "$dir"; then die "something is already mounted at ${dir}: run  estate ${name} umount  first"; fi
+
+  # -- the public records (nothing secret is read before these have been checked) --
+  rec="_helper.${name}.${ZONE}"
+  dns_ask TXT "$rec"
+  txt="$(printf '%s' "$DNS_OUT" | tr -d '"')"
+  [ -n "$txt" ] || die "the DNS record ${rec} (TXT) is missing, so the seedbox account is not known"
+  host="helper.${name}.${ZONE}"
+  dns_a "$host" || die "the DNS record ${host} (an A record) is missing, so the seedbox is not known"
+  set -f
+  for kv in $txt; do
+    case "$kv" in user=*) user="${kv#user=}" ;; port=*) port="${kv#port=}" ;; dir=*) rdir="${kv#dir=}" ;; crypt=*) crypt="${kv#crypt=}" ;; esac
+  done
+  set +f
+  [ -n "$user" ] || die "the record ${rec} has no user=<account> entry"
+  [ -n "$port" ] || die "the record ${rec} has no port=<ssh port> entry"
+  case "$user" in *[!A-Za-z0-9._-]*) die "the user= entry in ${rec} is not a plain account name; nothing was sent" ;; esac
+  case "$port" in *[!0-9]*) die "the port= entry in ${rec} is not a number; nothing was sent" ;; esac
+  case "$rdir" in *[!A-Za-z0-9._/-]*) die "the dir= entry in ${rec} has odd characters; nothing was sent" ;; esac
+  case "/${rdir}/" in */../*) die "the dir= entry in ${rec} has a '..' segment; nothing was sent" ;; esac
+  while :; do case "$rdir" in /*) rdir="${rdir#/}" ;; ./*) rdir="${rdir#./}" ;; *) break ;; esac; done
+  rdir="${rdir%/}"
+  [ "$crypt" = 1 ] || crypt=0
+  if [ "$rw" = 1 ] && [ "$crypt" != 1 ]; then
+    die "--rw is refused: the folder is not encrypted (the record ${rec} has no crypt=1), so what you wrote would reach the seedbox readable"
+  fi
+  # The account password goes to the host these records name; unsigned DNS may not decide that.
+  [ "$DNS_UNVERIFIED" = 0 ] || die "the zone's own name servers did not answer; these records came from your resolver and are not trusted with your seedbox login. Nothing was sent."
+
+  # -- the host key must already be pinned (never accepted blind) --
+  kh="${HOME}/.ssh/known_hosts"
+  case "$port" in 22) spec="$host" ;; *) spec="[${host}]:${port}" ;; esac
+  if ! ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1; then
+    printf 'estate: the seedbox host key is not in %s, so nothing was sent. Fetch it, compare the fingerprint with your notes, then add it:\n' "$kh" >&2
+    printf '  ssh-keyscan -p %s -t ed25519,ecdsa,rsa %s > seedbox.keys; ssh-keygen -lf seedbox.keys; cat seedbox.keys >> %s\n' "$port" "$host" "$kh" >&2
+    exit 2
+  fi
+  # rclone offers its own key order: ask for exactly the types on record (same rule as the machines).
+  while read -r t; do
+    case "$t" in ''|*[!A-Za-z0-9@._-]*) continue ;; esac
+    [ "$t" = ssh-rsa ] && t="rsa-sha2-512 rsa-sha2-256 ssh-rsa"
+    case " $algs " in *" $t "*) ;; *) algs="${algs:+$algs }$t" ;; esac
+  done < <(ssh-keygen -F "$spec" -f "$kh" 2>/dev/null | awk '$1 !~ /^[#@]/ {print $2}')
+
+  # -- the keyring: the account login, and (encrypted folder) the folder key --
+  login="$(keyring_get "${name}-helper")"; rc=$?
+  case "$rc" in
+    0) ;;
+    2) die "no keyring tool (secret-tool or macOS security): the seedbox login lives in the keyring entry ${name}-helper" ;;
+    *) die "no keyring entry ${name}-helper (the seedbox login, user:password); see the handbook page for how to store it" ;;
+  esac
+  keyring_value_ok "$login" || die "keyring entry ${name}-helper is not a single user:password line"
+  luser="${login%%:*}"; lpw="${login#*:}"; login=""
+  [ "$luser" = "$user" ] || die "keyring entry ${name}-helper is for the account '${luser}', but the DNS record ${rec} names '${user}'; nothing was sent"
+  if [ "$crypt" = 1 ]; then
+    key="$(keyring_get "${name}-folder-key")"; rc=$?
+    case "$rc" in
+      0) ;;
+      2) die "no keyring tool (secret-tool or macOS security): the folder key lives in the keyring entry ${name}-folder-key" ;;
+      *) die "no keyring entry ${name}-folder-key (the folder key, password:salt); see the handbook page for how to store it" ;;
+    esac
+    keyring_value_ok "$key" || die "keyring entry ${name}-folder-key is not a single password:salt line"
+    fpw="${key%%:*}"; fsalt="${key#*:}"; key=""
+  fi
+
+  mkdir -p "$dir" || die "cannot create ${dir}"
+  [ -z "$(ls -A "$dir" 2>/dev/null)" ] || die "${dir} is not empty - pick an empty folder: estate ${name} mount <dir>"
+
+  OB_PASS="$(printf '%s' "$lpw" | rclone obscure - 2>/dev/null)"; lpw=""
+  [ -n "$OB_PASS" ] || die "rclone could not prepare the login"
+  OB_KEY=""; OB_SALT=""
+  if [ "$crypt" = 1 ]; then
+    OB_KEY="$(printf '%s' "$fpw" | rclone obscure - 2>/dev/null)"; OB_SALT="$(printf '%s' "$fsalt" | rclone obscure - 2>/dev/null)"; fpw=""; fsalt=""
+    [ -n "$OB_KEY" ] && [ -n "$OB_SALT" ] || die "rclone could not prepare the folder key"
+  fi
+  top="${SFTP_R}:${rdir}"; [ "$crypt" = 0 ] || top="${CRYPT_R}:"
+  # A first listing proves login, host key and key. A folder opened with the wrong key lists as EMPTY (rclone skips what it
+  # cannot decrypt), so an empty answer is never called mounted.
+  ml="$(rclone_env lsf --max-depth 1 "$top" 2>/dev/null)" \
+    || die "rclone could not list the seedbox folder (login, host key or port refused); nothing was mounted"
+  [ -n "$ml" ] || die "the seedbox folder listed as empty: with an encrypted folder that means the wrong folder key (keyring entry ${name}-folder-key); nothing was mounted"
+  # No --vfs-cache-mode: the default (off) keeps no plain copy on this disk; writes (--rw) are therefore sequential only.
+  if [ "$rw" = 0 ]; then rclone_env mount "$top" "$dir" --daemon --read-only --no-modtime || die "rclone could not mount the folder"
+  else rclone_env mount "$top" "$dir" --daemon --no-modtime || die "rclone could not mount the folder"; fi
+  OB_PASS=""; OB_KEY=""; OB_SALT=""
+  mounted_at "$dir" || die "rclone returned but nothing is mounted at ${dir}"
+  ( umask 077; mkdir -p "$CFG_DIR" && printf '%s\n' "$dir" > "$(mount_state_file "$name")" )
+  if [ "$rw" = 1 ]; then printf 'mounted %s at %s (read-write; undo with: estate %s umount)\n' "$name" "$dir" "$name"
+  else printf 'mounted %s at %s (read-only; undo with: estate %s umount)\n' "$name" "$dir" "$name"; fi
+}
+
+cmd_umount() {
+  local name="$1" dir="" sf
+  [ -n "${HOME:-}" ] || die "HOME is not set"
+  sf="$(mount_state_file "$name")"
+  [ -f "$sf" ] && dir="$(sed -n 1p "$sf")"
+  [ -n "$dir" ] || dir="$(mount_default_dir "$name")"
+  if ! mounted_at "$dir"; then rm -f "$sf"; die "nothing is mounted for ${name} (looked at ${dir})"; fi
+  mount 2>/dev/null | grep -F " on ${dir} " | grep -q " fuse" || die "${dir} is not this command's mount; left alone"
+  if [ "$(uname -s)" = Darwin ]; then umount "$dir" || die "could not unmount ${dir} (something is using it?)"
+  elif have fusermount3; then fusermount3 -u "$dir" || die "could not unmount ${dir} (something is using it?)"
+  elif have fusermount; then fusermount -u "$dir" || die "could not unmount ${dir} (something is using it?)"
+  else umount "$dir" || die "could not unmount ${dir}"; fi
+  rm -f "$sf"
+  printf 'unmounted %s\n' "$dir"
+}
+
+# ---- fetch / push / build (issue #1595) ----
+# A laptop has no checkout, so the container mover (bin/dev-container-move.sh, #1140/#1589) is fetched from the public
+# mirror, NEXT TO THIS FILE, and run only when its sha256 equals the value carried here. A changed file (a hijacked
+# mirror, a bad mirror run, a mover newer than this copy) is refused and named; the cure is the install line again.
+# tests/estate_laptop.sh checks this value against the committed mover, so the two cannot drift apart.
+MOVER_SHA256="8c4b39b301a242f97dac31a3ef858b2fc676fc33f629545e96847d52571a6bee"
+MOVER_URL="${MIRROR_URL%/*}/dev-container-move.sh"
+
+sha256_of() {   # <file> -> the hex digest on stdout
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
+  elif have openssl; then openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else return 1; fi
+}
+
+# The mover needs bash 4 (mapfile, namerefs); a stock macOS has 3.2 as /bin/bash. BASH4 = the first bash that is new enough.
+BASH4=""
+find_bash4() {
+  local b
+  for b in "$(command -v bash 2>/dev/null)" /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [ -n "$b" ] && [ -x "$b" ] || continue
+    if "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then BASH4="$b"; return 0; fi
+  done
+  return 1
+}
+
+# The host key must ALREADY be pinned under the name we will connect to (never accepted blind).
+need_pinned_key() {   # <host> <port> <what>
+  local host port="$2" what="$3" kh="${HOME}/.ssh/known_hosts" spec
+  host="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"   # ssh looks names up in lower case
+  case "$port" in 22) spec="$host" ;; *) spec="[${host}]:${port}" ;; esac
+  ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
+  # ssh looks port 22 up under the plain name only, so a key kept as [name]:22 would not be the one it checks
+  if [ "$port" = 22 ] && ssh-keygen -F "[${host}]:22" -f "$kh" >/dev/null 2>&1; then
+    die "the ${what} host key is in ${kh} as [${host}]:22, but ssh looks port 22 up under the plain name ${host}; add it again under that name. Nothing was sent."
+  fi
+  printf 'estate: the %s host key is not in %s, so nothing was sent. Fetch it, compare the fingerprint with your notes, then add it:\n' "$what" "$kh" >&2
+  printf '  ssh-keyscan -p %s -t ed25519,ecdsa,rsa %s > host.keys; ssh-keygen -lf host.keys; cat host.keys >> %s\n' "$port" "$host" "$kh" >&2
+  exit 2
+}
+
+# Fetch the mover to a private folder and run it only if its digest matches the pin. MOVER_TMP is removed by the caller.
+MOVER_TMP=""
+MOVER_PATH=""
+get_mover() {
+  local got
+  have curl || die "curl is not installed"
+  find_bash4 || die "the container mover needs bash 4 or newer; on a Mac: brew install bash"
+  MOVER_TMP="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/estate-mover.XXXXXX")" || die "cannot make a private temporary folder"
+  mkdir -p "${MOVER_TMP}/bin"
+  MOVER_PATH="${MOVER_TMP}/bin/dev-container-move.sh"
+  curl -fsS --proto '=https,file' --proto-redir =https --max-time 30 -o "$MOVER_PATH" "$MOVER_URL" 2>/dev/null \
+    || { rm -rf "$MOVER_TMP"; die "could not download the container mover from ${MOVER_URL}"; }
+  got="$(sha256_of "$MOVER_PATH")" || { rm -rf "$MOVER_TMP"; die "no sha256 tool (sha256sum, shasum or openssl) to check the container mover"; }
+  if [ "$got" != "$MOVER_SHA256" ]; then
+    rm -rf "$MOVER_TMP"
+    die "the container mover from the public mirror is not the one this copy of estate was made for (sha256 differs); it was NOT run. Fetch estate again: ${MIRROR_URL}"
+  fi
+}
+
+# run_mover <estate> <mover args...>: the dev server is the `Host <name>-dev` entry of ~/.ssh/config. The mover gets the
+# ALIAS (so that entry's User, keys and options apply) and its user, in its environment only (never argv).
+run_mover() {
+  local name="$1" rc; shift
+  have ssh || die "ssh is not installed"
+  need_ssh_entry "${name}-dev" "development server"
+  ssh_unsafe "$SSH_G" && die "the entry Host ${name}-dev (or a Host pattern that matches it) in your ~/.ssh/config sets ${UNSAFE}, so ssh would check another key or path than the one estate checks; remove it there. Nothing was sent."
+  need_pinned_key "$SSH_HOST" "$SSH_PORT" "development server"
+  have rsync || die "rsync is not installed"
+  [ -n "${SSH_AUTH_SOCK:-}" ] || printf 'note: no ssh agent is running; ssh will use the key files you have, and ask for a passphrase if one is set\n' >&2
+  get_mover
+  ( export DEVSERVER_HOST="${name}-dev" DEVSERVER_USER="$SSH_USER"; exec "$BASH4" "$MOVER_PATH" "$@" )
+  rc=$?
+  rm -rf "$MOVER_TMP"
+  return "$rc"
+}
+
+container_ok() { case "$1" in ''|*[!a-z0-9-]*|-*) return 1 ;; esac; [ "${#1}" -le 41 ]; }
+fetch_root() { printf '%s' "${DEVCOPY_FETCH_DIR:-${HOME}/dev-container-fetch}"; }
+
+cmd_fetch() {   # <estate> <container> [dest]
+  local name="$1"; shift
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: estate ${name} fetch <container> [dest]"
+  container_ok "$1" || die "'$1' is not a container name (lower-case letters, digits, dashes)"
+  have ssh-keygen || die "ssh-keygen is not installed (it comes with ssh)"
+  # All four folders, into a dated folder; the mover pauses the container while it is read and drops links that leave the folder.
+  if [ "$#" = 2 ]; then run_mover "$name" fetch all "$1" "$2"; else run_mover "$name" fetch all "$1"; fi
+}
+
+cmd_push() {   # <estate> <container> [src] [--dry-run]
+  local name="$1"; shift
+  local c="" src="" dry="" a latest k
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry="--dry-run" ;;
+      -*) die "unknown flag '$a' (push takes <container> [src] and --dry-run)" ;;
+      *) if [ -z "$c" ]; then c="$a"; elif [ -z "$src" ]; then src="$a"; else die "push takes a container and one source folder"; fi ;;
+    esac
+  done
+  [ -n "$c" ] || die "usage: estate ${name} push <container> [src]"
+  container_ok "$c" || die "'$c' is not a container name (lower-case letters, digits, dashes)"
+  have ssh-keygen || die "ssh-keygen is not installed (it comes with ssh)"
+  if [ -z "$src" ]; then
+    # the newest dated folder an earlier fetch made (dated names sort; hidden half-made ones start with a dot)
+    latest="$(ls -1 "$(fetch_root)/${c}" 2>/dev/null | grep -v '^\.' | sort | tail -n1)"
+    [ -n "$latest" ] || die "no fetched set for ${c} under $(fetch_root)/${c}; give the folder: estate ${name} push ${c} <src>"
+    src="$(fetch_root)/${c}/${latest}"
+  fi
+  case "$src" in *[[:cntrl:]]*) die "the folder name has a control character" ;; esac
+  for k in repos memory conversations logins; do
+    [ -d "${src}/${k}" ] && [ ! -L "${src}/${k}" ] || die "${src} is not a fetched set: no ${k} folder in it"
+  done
+  # copy's own confirmation (the per-folder counts, then a typed yes) comes from the mover.
+  if [ -n "$dry" ]; then
+    run_mover "$name" copy --dry-run --repo-dir "${src}/repos" --memory-dir "${src}/memory" \
+      --conversations-dir "${src}/conversations" --logins-dir "${src}/logins" "$c"
+  else
+    run_mover "$name" copy --repo-dir "${src}/repos" --memory-dir "${src}/memory" \
+      --conversations-dir "${src}/conversations" --logins-dir "${src}/logins" "$c"
+  fi
+}
+
+# ---- build: the cold start of a freshly installed box ----
+# The one-liner of the handbook (PROVIDER-BOX-INSTALL, step 4) run as root on the box over ssh, with the helper's answers filled
+# in from DNS. The helper PASSWORD is not something this command holds: the hook asks for it on the box's own terminal and it
+# is typed there (never argv, never a file). Default = a dry run that prints and runs nothing.
+
+# follow the newest step feed (state/logs/<lap>-steps.log) in the mounted seedbox folder, until interrupted.
+build_follow() {   # <estate>
+  local name="$1" dir sf fd feed last_feed="" last_n=0 cur
+  [ -n "${HOME:-}" ] || die "HOME is not set"
+  sf="$(mount_state_file "$name")"
+  if [ -f "$sf" ]; then dir="$(sed -n 1p "$sf")"; else dir="$(mount_default_dir "$name")"; fi
+  mounted_at "$dir" || die "the seedbox folder is not mounted, so the step feed cannot be read: run  estate ${name} mount  first, then  estate ${name} build --follow"
+  fd="${dir}/state/logs"
+  printf 'following the newest step feed in %s (Ctrl-C stops watching; the build goes on)\n' "$fd"
+  while :; do
+    feed="$(ls -1 "$fd" 2>/dev/null | grep -- '-steps\.log$' | sort | tail -n1)"
+    if [ -n "$feed" ]; then
+      cur="$(wc -l < "${fd}/${feed}" | tr -d ' ')"
+      if [ "$feed" != "$last_feed" ]; then printf -- '-- %s --\n' "$feed"; tail -n 20 "${fd}/${feed}" | tr -d '\033\r'
+      elif [ "$cur" -gt "$last_n" ]; then tail -n +"$(( last_n + 1 ))" "${fd}/${feed}" | tr -d '\033\r'; fi
+      last_feed="$feed"; last_n="$cur"
+    fi
+    sleep "${ESTATE_FOLLOW_SECS:-10}"
+  done
+}
+
+cmd_build() {
+  local name="$1"; shift
+  local go=0 follow=0 a txt kv user="" port="" rec host bhost bport hookurl cmd ans g bopts
+  for a in "$@"; do
+    case "$a" in --go) go=1 ;; --follow) follow=1 ;; *) die "unknown argument '$a' (build takes --go or --follow)" ;; esac
+  done
+  load_zone
+  if [ "$follow" = 1 ]; then build_follow "$name"; return; fi
+  have dig || die "dig is not installed (it reads the estate's DNS records)"
+  have ssh || die "ssh is not installed"
+  have ssh-keygen || die "ssh-keygen is not installed (it comes with ssh)"
+  rec="_helper.${name}.${ZONE}"
+  dns_ask TXT "$rec"
+  txt="$(printf '%s' "$DNS_OUT" | tr -d '"')"
+  [ -n "$txt" ] || die "the DNS record ${rec} (TXT) is missing, so the seedbox account is not known"
+  host="helper.${name}.${ZONE}"
+  dns_a "$host" || die "the DNS record ${host} (an A record) is missing, so the seedbox is not known"
+  set -f
+  for kv in $txt; do case "$kv" in user=*) user="${kv#user=}" ;; port=*) port="${kv#port=}" ;; esac; done
+  set +f
+  [ -n "$user" ] || die "the record ${rec} has no user=<account> entry"
+  [ -n "$port" ] || die "the record ${rec} has no port=<ssh port> entry"
+  case "$user" in *[!A-Za-z0-9._-]*) die "the user= entry in ${rec} is not a plain account name; nothing was sent" ;; esac
+  case "$port" in *[!0-9]*) die "the port= entry in ${rec} is not a number; nothing was sent" ;; esac
+  [ "$DNS_UNVERIFIED" = 0 ] || die "the zone's own name servers did not answer; these records came from your resolver and are not trusted to say where a new box sends its seedbox password. Nothing was sent."
+  # The box: the `Host <name>-box` entry. ssh connects to its HostName and Port as resolved here, not to the alias, so the
+  # pinned-key check below is on exactly the host:port connected to (an alias could add a HostKeyAlias or known-hosts file).
+  need_ssh_entry "${name}-box" box
+  bhost="$SSH_HOST"; bport="$SSH_PORT"
+  # What build really connects to is root@<host> -p <port>, which ssh matches against ~/.ssh/config again: these
+  # options pin the path and the key file, and a `Host` pattern that still changes the host or the key is refused.
+  bopts=(-o StrictHostKeyChecking=yes -o ForwardAgent=no -o ProxyJump=none -o ProxyCommand=none -o KnownHostsCommand=none -o VerifyHostKeyDNS=no
+         -o "UserKnownHostsFile=${HOME}/.ssh/known_hosts" -o GlobalKnownHostsFile=/dev/null -p "$bport")
+  g="$(ssh -G "${bopts[@]}" "root@${bhost}" 2>/dev/null)" || die "ssh -G could not read your ~/.ssh/config (try: ssh -G root@${bhost}); nothing was sent"
+  [ "$(g_val "$g" hostname | tr 'A-Z' 'a-z')" = "$(printf '%s' "$bhost" | tr 'A-Z' 'a-z')" ] \
+    || die "your ~/.ssh/config turns root@${bhost} into another host ($(g_val "$g" hostname)), by a Host pattern with a HostName; nothing was sent"
+  ssh_unsafe "$g" && die "your ~/.ssh/config sets ${UNSAFE} for root@${bhost} (a Host pattern that matches it), so ssh would check another key than the one estate checks; nothing was sent"
+  hookurl="${MIRROR_URL%/*}/hook.sh"
+  cmd="PROVISIONER_HELPER=${user}@${host} PROVISIONER_HELPER_PORT=${port} bash <(curl -fsSL ${hookurl})"
+  printf 'build %s (a freshly installed box):\n' "$name"
+  printf '  on:     root@%s, ssh port %s (your ~/.ssh/config entry Host %s-box; you type the seedbox password in that terminal when it asks)\n' "$bhost" "$bport" "$name"
+  printf '  runs:   %s\n' "$cmd"
+  printf '  then:   follow the step feed: estate %s mount, then estate %s build --follow\n' "$name" "$name"
+  if [ "$go" = 0 ]; then
+    printf 'dry run: nothing was run. Add --go to run it (you will be asked to type the estate name).\n'
+    return 0
+  fi
+  need_pinned_key "$bhost" "$bport" "box"
+  printf 'This starts a cold start on the box named above. Type the estate name (%s) to confirm: ' "$name" >&2
+  read -r ans || ans=""
+  [ "$ans" = "$name" ] || die "not confirmed; nothing was run"
+  ssh -t "${bopts[@]}" "root@${bhost}" "$cmd" \
+    || die "the build command did not finish cleanly on the box (see its output above)"
+  printf 'the hook is running on the box; to watch it: estate %s mount, then estate %s build --follow\n' "$name" "$name"
+}
+
+[ "$#" -ge 1 ] || usage
+case "$1" in
+  init) shift; cmd_init "$@" ;;
+  version|--version) cmd_version ;;
+  -h|--help|help) usage ;;
+  *)
+    name="$1"; verb="${2:-}"
+    case "$name" in ''|*[!a-z0-9-]*|-*) die "'$name' is not an estate name" ;; esac
+    case "$verb" in
+      status) cmd_status "$name" ;;
+      mount) shift 2; cmd_mount "$name" "$@" ;;
+      umount) cmd_umount "$name" ;;
+      fetch) shift 2; cmd_fetch "$name" "$@" ;;
+      push) shift 2; cmd_push "$name" "$@" ;;
+      build) shift 2; cmd_build "$name" "$@" ;;
+      hook) printf 'estate: "hook" is now called "build": estate %s build\n' "$name" >&2; exit 2 ;;
+      '') usage ;;
+      *) die "unknown verb '$verb'" ;;
+    esac ;;
+esac

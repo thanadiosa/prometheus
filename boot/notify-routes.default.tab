@@ -144,6 +144,13 @@ fleet.upgrade.report   yes  normal    -
 # The restart job's one push (#1184): machines numbered, never named.
 fleet.reboot.report    yes  normal    -
 
+# The power schedule (#1561): a machine the estate switches off and on by weeks. `power.report` is the
+# one line after a stop or a start that worked; `power.failed` is a machine that did not stop (or a
+# backup that never finished, so it was left running) or did not come back, named. HIGH: a machine
+# that should be serving and is not. The names are the fleet's own, kept through the scrub; no address.
+power.failed           yes  high      -
+power.report           yes  normal    -
+
 # Planned reboots (#1488): one warning ~10 minutes ahead of the host's window or the fleet's
 # scheduled restart ("The host reboots at 18:30 (kernel update): every machine restarts"), and
 # one "reboot due" notice when an update asked for a reboot that waits for a later window. Both
@@ -357,6 +364,12 @@ maintenance.jenkins.build_failed yes  normal    -
 # started right after each update, could not. Nothing was rolled back; the phone is the whole
 # point, because without it the first job to need the login is the one that finds out. NORMAL.
 maintenance.jenkins.login_failed yes  normal    -
+# `upgrade_failed` (issue #1583) -- the window tried newer versions of the job server or its add-ons
+# (the estate's own upgrade policy, not a repository pin) and they did not take: the old ones are
+# back, or Jenkins needs a hand. It is sent IN ADDITION to the row above that says how far the
+# rollback got, so the phone names the cause. NORMAL: the net worked; the same versions are not
+# tried again until upstream has a newer one.
+maintenance.jenkins.upgrade_failed yes  normal    -
 # `hold_stuck` (issue #1570) -- the release hold could not decide and kept an estate on its current
 # commit. Nothing is broken, the estate just does not move; LOW, and sync-checkout sends it at most
 # once per estate per 24 hours. Above the maintenance.* family row so the first match is the push.
@@ -380,6 +393,12 @@ maintenance.jenkins.updated     yes  low       -
 # LOG-ONLY. `current` is the nightly no-op and would be pure noise; `deferred` costs one
 # day and the next window retries it, so a push would be asking for attention nobody
 # needs to give.
+# `upgrade_failed` / `upgrade_broken` (issue #1584) -- a machine's own upgrade window (rclone or a container
+# image, by the estate's policy) did not take. failed: the previous version is back and works, NORMAL;
+# broken: the rollback did not restore a working state either and the machine needs a person, HIGH. The
+# message names the machine and the thing, never an address; one message per machine per window.
+maintenance.machine.upgrade_broken yes  high      -
+maintenance.machine.upgrade_failed yes  normal    -
 maintenance.*                no   normal    -      # pin.current &c: log-only — a weekly
                                                     # "nothing to do" push is how a channel
                                                     # gets muted.
@@ -415,6 +434,10 @@ security.anomaly.found yes  high      -
 # bootstrap/job-failed-alert.sh, called from a job's `post { failure }`: the job's name, build
 # number and link, nothing else. HIGH: a job that failed unattended is what a phone is for.
 job.failed             yes  high      -
+
+# ── A scheduled job skipped on the operator's word (issue #1590) ──────────────
+# bootstrap/job-skip-alert.sh: the job's name only. NORMAL: the operator asked for it; a receipt.
+job.skipped            yes  normal    -
 
 # ── The test gate's first red (issue #1572) ───────────────────────────────────
 # tests/run_all.sh, once per run: "Gate <sha>: first red <suite> after <m> min". HIGH: the gate runs for
