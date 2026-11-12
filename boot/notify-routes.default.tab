@@ -27,6 +27,8 @@
 # the estate chroot's secrets/ (control-boot.sh pulls it to /etc/provisioner/notify-routes.tab),
 # or set the `notify_routes` list in the estate's group_vars/vault and let
 # ansible/roles/notify render it. Either wins over this file; neither is required.
+# To change single events without copying this file, set `notify_route_changes` (event, pushover,
+# priority) in the estate's group_vars/vault: those lines are laid above this table.
 
 # ── Terminal outcomes: the two events worth waking up for ─────────────────────
 pipeline.failed        yes  high      -      # the estate died — #59's loud failure beacon
@@ -157,6 +159,8 @@ power.report           yes  normal    -
 # are sent only when the reboot will really happen / is really waiting; neither carries an address.
 reboot.warning         yes  normal    -
 reboot.due             yes  normal    -
+host.disk.locked       yes  high      -      # the box's disks are locked: the machines are OFF (#1609)
+host.disk.unlocked     yes  normal    -
 
 # The scheduled backup's old-copy alarm (#1548): a machine whose items are saved by its own night
 # job has one that is older than the limit (default 30 h) or cannot be read. NORMAL: a missed night
@@ -364,6 +368,19 @@ maintenance.jenkins.build_failed yes  normal    -
 # started right after each update, could not. Nothing was rolled back; the phone is the whole
 # point, because without it the first job to need the login is the one that finds out. NORMAL.
 maintenance.jenkins.login_failed yes  normal    -
+# `disk.low` (issue #1649) -- the control node's disk is still under the warning size AFTER the nightly
+# cleanup; the job server takes itself offline near 1 GiB free. NORMAL: there is usually time to act.
+maintenance.disk.low             yes  normal    -
+# `pin_move.skipped` and `pin_move.not_run` (issue #1568) -- the daily trial run of new job server and add-on
+# versions: a version failed it and was skipped, or the trial could not run or could not tell. Nothing was
+# changed in either case; a pin that stays behind is the cost, so NORMAL. Success is quiet.
+maintenance.pin_move.skipped yes  normal    -
+maintenance.pin_move.not_run yes  normal    -
+# `pin_move.unreadable` and `jenkins.upgrade_unreadable` (issue #1567) -- the move or the update window
+# could not read a security warning's version pattern for an add-on; it is not claimed free of warnings.
+# One message per run, LOW (no sound): the build is marked unstable and the log names them.
+maintenance.pin_move.unreadable yes  low       -
+maintenance.jenkins.upgrade_unreadable yes  low       -
 # `upgrade_failed` (issue #1583) -- the window tried newer versions of the job server or its add-ons
 # (the estate's own upgrade policy, not a repository pin) and they did not take: the old ones are
 # back, or Jenkins needs a hand. It is sent IN ADDITION to the row above that says how far the
@@ -376,13 +393,13 @@ maintenance.jenkins.upgrade_failed yes  normal    -
 maintenance.release.hold_stuck yes  low       -
 # ── Player mounts: the player's container cannot read a folder it binds ───────
 # Sent by the control node's player-mount watch after two failed checks in a row, once per outage.
-# HIGH: files look missing in the player until someone acts. `recovered` is the all-clear.
-# `watch_blind` is the watch itself going deaf (no usable answer for many checks in a row, or the
-# watch cannot run at all): HIGH, since a silent watch looks the same as a healthy estate.
-player.mount.failed          yes  high      -
-player.mount.recovered       yes  normal    -
-player.mount.watch_blind     yes  high      -
-player.mount.watch_seen      yes  normal    -
+# NO PHONE (issue #1602): the watch keeps running and logging; sessions and the status page read it.
+# An estate that wants the phone back sets `notify_route_changes` (ansible/roles/notify).
+# `watch_blind` is the watch itself going deaf (no usable answer for many checks in a row).
+player.mount.failed          no   high      -
+player.mount.recovered       no   normal    -
+player.mount.watch_blind     no   high      -
+player.mount.watch_seen      no   normal    -
 # `updated` — the control plane was replaced under you last night and came back healthy.
 # LOW: informational, no sound, look when you look. It is genuinely rare (the usual
 # outcome is `current`, which sends nothing), so it is not push budget the operator will
@@ -440,9 +457,16 @@ job.failed             yes  high      -
 job.skipped            yes  normal    -
 
 # ── The test gate's first red (issue #1572) ───────────────────────────────────
-# tests/run_all.sh, once per run: "Gate <sha>: first red <suite> after <m> min". HIGH: the gate runs for
-# hours and the first red used to be seen only at the verdict.
-tests.gate.first_red   yes  high      -
+# tests/run_all.sh, once per run: "Gate <sha>: first red <suite> after <m> min". NO PHONE (issue #1602):
+# results are read from the job server and its RED lines, not pushed to the operator.
+tests.gate.first_red   no   high      -
+
+# A backup repository failed its check (#1604): a snapshot names data that is not there, or the seedbox
+# copy lacks files. Log and status page only (no phone, #1602). Item names, no machine.
+backup.repo.damaged    no   normal    -
+# ── A pushed commit carries an estate secret in the clear (issue #1599) ───────
+# bootstrap/commit-guard-alert.sh, once per run: branch and short shas. HIGH: once pushed it is in history for ever.
+secret.guard.leak      yes  high      -
 
 # ── Catch-all: anything not named above is log-only. Keep this line LAST. ──────
 *                      no   normal    -
