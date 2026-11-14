@@ -552,7 +552,16 @@ A local modification or a diverged branch stops a fast-forward. Inspect it, or r
   fi
 else
   log "cloning the provisioner repo into ${REPO_DIR}"
-  git clone "$REPO_URL" "$REPO_DIR" \
+  # Same retry as the helper pulls (#1662): one reset connection must not cost the whole boot.
+  # A failed try's half-made checkout is removed so the next clone starts clean - only the
+  # directory this clone created, never one that was already there.
+  _repo_preexisted=0; [[ -e $REPO_DIR || -L $REPO_DIR ]] && _repo_preexisted=1
+  clone_once() {
+    git clone "$REPO_URL" "$REPO_DIR" && return 0
+    if (( ! _repo_preexisted )) && [[ -n $REPO_DIR && $REPO_DIR != / ]]; then rm -rf -- "$REPO_DIR"; fi
+    return 1
+  }
+  retry_backoff clone_once \
     || die "git clone failed — this node could not fetch the provisioner code.
 The boot chain runs the REPO's code, so there is no staged copy to fall back to.
 Check, in this order:
@@ -562,7 +571,7 @@ Check, in this order:
   # A fresh clone lands on the default branch, which IS "newest" — an unpinned boot needs
   # nothing more. A pinned one still fetches tags: `git clone` brings only the tags reachable
   # from the branches it cloned, and a release tag on a maintenance branch is not among them.
-  [[ -n $PROVISIONER_VERSION ]] && { git -C "$REPO_DIR" fetch --tags --force origin >/dev/null 2>&1 || true; }
+  [[ -n $PROVISIONER_VERSION ]] && { retry_backoff git -C "$REPO_DIR" fetch --tags --force origin >/dev/null 2>&1 || true; }
 fi
 
 # ── Pin the checkout at the requested version (issue #232) ────────────────────
