@@ -2549,8 +2549,7 @@ helper_ls() {
 # THE STATUS AND THE OUTPUT ARE SEPARATE ANSWERS, because ssh's rc cannot carry both: 255 is
 # both "the transport failed" and a remote program's own exit 255. So:
 #   * THIS function's rc says whether the program RAN — 0 it ran, 2 no transport, 3 the
-#     helper has no exec channel (SFTP-only, a real seedbox shape), 6 the access path is
-#     file-transfer-only by construction (#1664; KEYED crypt mode is not refused), 4 the LOCAL program file
+#     helper has no exec channel (SFTP-only, a real seedbox shape), 4 the LOCAL program file
 #     was not readable (a caller's own path is wrong, not the seedbox), 5 the LOCAL argument
 #     encoding failed before anything was sent (#913 — 4 and 5 used to be one code, and a
 #     caller could not tell "wrong path" from "base64 broke" apart).
@@ -2564,15 +2563,8 @@ helper_run_python() {
   # that hangs must fail rather than hold the lap open.
   local _HELPER_OP_TIMEOUT="${PROVISIONER_HELPER_RUN_TIMEOUT:-120}"
   helper_detect || return 2
-  # #1664: rc 6, not 3 - the access path is file transfer only BY CONSTRUCTION (helper_detect never
-  # probes a shell there), which is not "this seedbox has no shell" (rc 3) and must not be worded
-  # as it. KEYED crypt mode is NOT refused: it encrypts file NAMES and contents for the rclone
-  # transfers, but this program reads no file in the folder and sends no secret - the probe and its
-  # arguments travel over the plain ssh exec channel exactly as in plain mode, and helper_detect
-  # already probed that channel (_HELPER_EXEC) with the working key. Refusing it (#1075, "no exec on
-  # encrypted names" - true of ls/test/rm, not of this) left every encrypted estate's outside check
-  # unable to run. No exec channel found still falls to rc 3 below.
-  _helper_crypt_alias && { _helper_log "run_python: the access path reaches the seedbox for file transfer only and never opens a shell on it, so a program cannot run there"; return 6; }
+  _helper_crypt_alias && { _helper_log "run_python: the access path reaches the seedbox for file transfer only and never opens a shell on it, so a program cannot run there"; return 3; }
+  _helper_crypt_on && { _helper_log "run_python: not available in crypt mode"; return 3; }
   [ "$_HELPER_EXEC" = 1 ] || return 3
   local prog="$1"; shift
   [ -r "$prog" ] || return 4

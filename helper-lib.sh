@@ -1408,7 +1408,8 @@ helper_ls() {
 helper_run_python() {
   local _HELPER_OP_TIMEOUT="${PROVISIONER_HELPER_RUN_TIMEOUT:-120}"
   helper_detect || return 2
-  _helper_crypt_alias && { _helper_log "run_python: the access path reaches the seedbox for file transfer only and never opens a shell on it, so a program cannot run there"; return 6; }
+  _helper_crypt_alias && { _helper_log "run_python: the access path reaches the seedbox for file transfer only and never opens a shell on it, so a program cannot run there"; return 3; }
+  _helper_crypt_on && { _helper_log "run_python: not available in crypt mode"; return 3; }
   [ "$_HELPER_EXEC" = 1 ] || return 3
   local prog="$1"; shift
   [ -r "$prog" ] || return 4

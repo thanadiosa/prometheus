@@ -1172,7 +1172,7 @@ _log_prerepo_fingerprints() {
 }
 _log_prerepo_fingerprints
 
-HOOK_LIB_SHA256="c9e29314f609c8da38a27f5fe0f4f30171db405e4842b2abeb677718145a3e74"
+HOOK_LIB_SHA256="ce05e6a7080f37d2fcc8bd0e8a0a3464c55f92ebcf89c33ece93ab929aad089e"
 HOOK_LIB_URL="${PROVISIONER_HOOK_LIB_URL:-https://raw.githubusercontent.com/thanadiosa/prometheus/main/helper-lib.sh}"
 hook_fetch_pinned_lib() {
   local try tries d tmp url="$HOOK_LIB_URL"
