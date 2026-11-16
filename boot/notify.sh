@@ -179,6 +179,7 @@ NOTIFY_RETRY_DELAY=3                               # seconds between attempts
 NOTIFY_ESTATE="${PROVISIONER_ESTATE:-}"            # names the estate in the push title (NOT secret)
 NOTIFY_EMERGENCY_RETRY=60                          # Pushover priority=2 requires retry+expire
 NOTIFY_EMERGENCY_EXPIRE=3600
+NOTIFY_PHONE=on                                    # #1602: off => every event log-only, whatever the table says
 
 # ── Logging: every line goes to stderr so the CALLER's log shows it ───────────
 # The caller (run-pipeline's tee'd log, or the pve-upgrade script's >>"$LOG_FILE")
@@ -235,7 +236,7 @@ _read_kv() {
 if [[ -r $CONF_FILE ]]; then
   for _k in NOTIFY_ENABLED NOTIFY_API_URL NOTIFY_CONNECT_TIMEOUT NOTIFY_MAX_TIME \
             NOTIFY_RETRIES NOTIFY_RETRY_DELAY NOTIFY_ESTATE \
-            NOTIFY_EMERGENCY_RETRY NOTIFY_EMERGENCY_EXPIRE; do
+            NOTIFY_EMERGENCY_RETRY NOTIFY_EMERGENCY_EXPIRE NOTIFY_PHONE; do
     _v="$(_read_kv "$CONF_FILE" "$_k")" && [[ -n $_v ]] && printf -v "$_k" '%s' "$_v"
   done
 fi
@@ -479,6 +480,9 @@ if [[ -n $DETAIL && -f $DETAIL && -r $DETAIL ]]; then
 fi
 
 _resolve_route "$EVENT"
+# #1602: `phone: off` in the estate settings silences every alert: log-only after the table, so no
+# table (shipped, estate, helper-staged) can reach the phone. Only an explicit on-word keeps it on.
+case "${NOTIFY_PHONE,,}" in on|yes|true|1) ;; *) R_SEND=0 ;; esac
 SAFE_DETAIL="$(_scrub "$DETAIL")"
 EVENT_KEY="$(printf '%s' "$EVENT" | tr -c 'A-Za-z0-9._-' '_')"
 SCOPE_KEY="$(printf '%s' "$NOTIFY_SCOPE" | tr -c 'A-Za-z0-9._-' '_')"

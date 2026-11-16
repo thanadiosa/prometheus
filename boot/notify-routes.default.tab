@@ -387,6 +387,11 @@ maintenance.jenkins.upgrade_unreadable yes  low       -
 # rollback got, so the phone names the cause. NORMAL: the net worked; the same versions are not
 # tried again until upstream has a newer one.
 maintenance.jenkins.upgrade_failed yes  normal    -
+# `warnings_unreadable` and `warnings_left` (issue #1678) -- after an update window the number of security
+# warnings that apply to the job server and its add-ons could not be read, or is above zero (the message names
+# the add-ons, the warning ids and why each was held). Never silent; NORMAL, the server itself is fine.
+maintenance.jenkins.warnings_unreadable yes  normal    -
+maintenance.jenkins.warnings_left yes  normal    -
 # `hold_stuck` (issue #1570) -- the release hold could not decide and kept an estate on its current
 # commit. Nothing is broken, the estate just does not move; LOW, and sync-checkout sends it at most
 # once per estate per 24 hours. Above the maintenance.* family row so the first match is the push.
