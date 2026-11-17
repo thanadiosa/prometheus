@@ -33,6 +33,11 @@
 # A box that comes up wrong has nothing on it: reinstall from the panel and run again.
 set -uo pipefail
 
+# err-trap (#1719): an unchecked failed command is reported as a WARN on stderr; it never stops the script.
+_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/err-trap.sh"
+# shellcheck source=err-trap.sh
+[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
+
 ROOT="${DEBIAN_TO_PVE_PROBE_DIR:-}"
 PORT_NAME=nic0   # our own name for the uplink card, pinned by MAC (#1237)
 LINK_FILE="${ROOT}/etc/systemd/network/10-provisioner-uplink.link"

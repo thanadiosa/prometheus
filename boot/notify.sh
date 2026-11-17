@@ -62,6 +62,11 @@
 
 set -o pipefail
 
+# err-trap (#1719): an unchecked failed command is reported as a WARN on stderr; it never stops the script.
+_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/err-trap.sh"
+# shellcheck source=err-trap.sh
+[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
+
 # ── Paths + resolution order ──────────────────────────────────────────────────
 NOTIFY_DIR="${PROVISIONER_NOTIFY_DIR:-/var/lib/provisioner/notify}"
 JOURNAL="${NOTIFY_DIR}/events.log"            # append-only history — THE authoritative record

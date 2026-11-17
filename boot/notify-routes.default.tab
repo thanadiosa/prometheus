@@ -159,6 +159,9 @@ power.report           yes  normal    -
 # are sent only when the reboot will really happen / is really waiting; neither carries an address.
 reboot.warning         yes  normal    -
 reboot.due             yes  normal    -
+host.pool.critical     yes  high      -      # the VM disk pool is past its critical percentage (#1706)
+host.pool.warning      yes  normal    -      # ... past its warning percentage
+host.pool.recovered    yes  normal    -      # ... and back under it
 host.disk.locked       yes  high      -      # the box's disks are locked: the machines are OFF (#1609)
 host.disk.unlocked     yes  normal    -
 
