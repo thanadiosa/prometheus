@@ -1,5 +1,8 @@
 #!/bin/bash
 set -uo pipefail
+
+set -E; exec {_et_fd}>&2 || _et_fd=2
+trap 'case "${BASH_COMMAND%%[=[:space:]]*}" in "["|"[["|test|"((") ;; *) printf "WARN  %s:%s: unchecked command failed (exit %s), carrying on: %s (arguments not shown)\n" "${0##*/}" "$LINENO" "$?" "${BASH_COMMAND%%[=[:space:]]*}" >&"$_et_fd" ;; esac' ERR
 reset
 
 _RD="${PROVISIONER_REMOTE_DIR:-}"
@@ -188,10 +191,78 @@ Nothing has been changed on this host."
     fi
     die "helper unreachable on :${port} (TCP connect failed) and no controlling terminal to re-ask on — check the address/port/DNS and re-run. Nothing has been changed."
   fi
-  mkdir -p ~/.ssh
-  ssh-keyscan -p "$port" "$helper_server" >> ~/.ssh/known_hosts 2>/dev/null || true
   break
 done
+
+hook_published_fp() {
+  local name txt tok v=""
+  [[ $helper_server == helper.?* ]] || return 0
+  name="_${helper_server}"
+  if command -v dig >/dev/null 2>&1; then
+    txt="$(dig +short +time=3 +tries=2 TXT "$name" 2>/dev/null | tr -d '"')"
+  elif command -v host >/dev/null 2>&1; then
+    txt="$(host -W 3 -t TXT "$name" 2>/dev/null | sed -n 's/.* descriptive text //p' | tr -d '"')"
+  else
+    return 0
+  fi
+  for tok in $txt; do
+    [[ $tok == hostkey=* ]] && { v="${tok#hostkey=}"; break; }
+  done
+  [[ -n $v ]] || return 0
+  if [[ $v =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
+    printf '%s' "$v"
+  else
+    warn "the helper record publishes a host-key fingerprint of the wrong shape; ignoring it."
+  fi
+  return 0
+}
+hook_pin_helper_key() {
+  local spec kh tmp want="${PROVISIONER_HELPER_FINGERPRINT:-}" line got ok=0 have_pin=0
+  kh=~/.ssh/known_hosts
+  case "$port" in ""|22) spec="$helper_server" ;; *) spec="[${helper_server}]:${port}" ;; esac
+  mkdir -p ~/.ssh
+  ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && have_pin=1
+  if [[ -z $want && $have_pin == 0 ]]; then   # nothing typed and nothing pinned: the estate's published record is the next source (#1697)
+    want="$(hook_published_fp)"
+    [[ -z $want ]] || log "using the host-key fingerprint published with this estate's records; it is still checked against the key the helper shows."
+  fi
+  if [[ -z $want && $have_pin == 0 && ${PROVISIONER_HELPER_TOFU:-} != 1 && $have_tty == 1 ]]; then
+    read -r -p "The seedbox's identity fingerprint (starts with SHA256:), as published with this estate: " want </dev/tty \
+      || die "lost the controlling terminal while asking for the helper host-key fingerprint."
+  fi
+  want="${want//[[:space:]]/}"
+  if [[ -z $want ]]; then
+    (( have_pin )) && return 0   # an earlier verified run or the image already pinned it; strict checking holds it
+    if [[ ${PROVISIONER_HELPER_TOFU:-} == 1 ]]; then
+      warn "PROVISIONER_HELPER_TOFU=1: trusting whatever key the helper shows on first contact, so the helper password goes to an unverified machine. Publish the fingerprint and drop this."
+      ssh-keyscan -p "$port" "$helper_server" >> "$kh" 2>/dev/null || true
+      return 0
+    fi
+    die "no host-key fingerprint for the helper, and none pinned on this host, so the password is NOT sent.
+Set PROVISIONER_HELPER_FINGERPRINT=SHA256:... (the value published for this estate) and run again.
+Nothing has been changed on this host."
+  fi
+  [[ $want =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || die "the helper host-key fingerprint is not in the form SHA256:<43 characters> - fix it and run again. Nothing has been changed."
+  if (( have_pin )); then   # a key saved by the old trust-on-first-use era must agree with the fingerprint given (#1683)
+    local saved; saved="$(ssh-keygen -F "$spec" -f "$kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')"
+    [[ $'\n'"$saved"$'\n' == *$'\n'"$want"$'\n'* ]] \
+      || die "the saved identity for the seedbox differs from the fingerprint given, so the password is NOT sent. Remove the old entry with: ssh-keygen -R '${spec}' and run again."
+  fi
+  tmp="$(umask 077; mktemp)" || die "cannot make a scratch file for the helper host key"
+  ssh-keyscan -T 10 -p "$port" "$helper_server" > "$tmp" 2>/dev/null || true
+  while IFS= read -r line; do
+    [[ -z $line || $line == \#* ]] && continue
+    got="$(ssh-keygen -lf /dev/stdin <<<"$line" 2>/dev/null | awk '{print $2}')"
+    if [[ $got == "$want" ]]; then
+      ok=1
+      ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 || printf '%s\n' "$line" >> "$kh"
+    fi
+  done < "$tmp"
+  rm -f "$tmp"
+  (( ok )) || die "the host key the helper shows does not match the fingerprint given (or the helper showed no key), so the password is NOT sent. Check the fingerprint, and that you are talking to the right machine."
+  return 0
+}
+hook_pin_helper_key
 
 install -d -m 0700 "$STATE_DIR" || die "could not create ${STATE_DIR}"
 auth_hint="${PROVISIONER_HELPER_AUTH:-}"
@@ -301,6 +372,10 @@ hook_crypt_vault_from_file() {   # <file> -> refuse a weak password, else derive
   lead="${vp%%[!"$ws"]*}"; vp="${vp#"$lead"}"; lead="${vp##*[!"$ws"]}"; vp="${vp%"$lead"}"
   [[ $vp != *$'\n'* ]] || { unset vp; return 1; }
   [[ -n $vp ]] || return 1
+  if [[ $vp =~ ^[0-9a-f]{64}$ && ${PROVISIONER_VAULT_MASTER_OK:-} != 1 ]]; then
+    unset vp
+    die "${f} looks like the long key ansible-vault uses on a migrated estate, not the vault password. Name the password file instead (~/.vault-${PROVISIONER_ESTATE}.master). If the password really is 64 hex characters, set PROVISIONER_VAULT_MASTER_OK=1."
+  fi
   if ! hook_crypt_weak "$vp"; then unset vp; die "$HOOK_CRYPT_WEAK_MSG"; fi
   hook_crypt_derive_store "$vp"; rc=$?; unset vp
   log "the vault password file ${f} was read; remove it when this run is done"
@@ -455,7 +530,7 @@ cm_opts=()
 [[ -n ${PROVISIONER_HELPER_CIPHERS-aes128-ctr} ]] && cm_opts+=(-o Ciphers="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}")
 [[ -n ${PROVISIONER_HELPER_MACS-hmac-sha2-256} ]] && cm_opts+=(-o MACs="${PROVISIONER_HELPER_MACS-hmac-sha2-256}")
 sftp_opts=(-o PreferredAuthentications=password -o PubkeyAuthentication=no
-           -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=accept-new
+           -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes
            -o ConnectTimeout=15 "${cm_opts[@]}" -P "$port")
 
 HOOK_DEFAULT_IDS=(id_rsa id_ecdsa id_ecdsa_sk id_ed25519 id_ed25519_sk id_xmss id_dsa)
@@ -591,6 +666,9 @@ hook_note_verified_id() {   # <scp -v transcript>
 
 hook_crypt_fetch_main() {
 set -uo pipefail
+
+_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/err-trap.sh"
+[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
 
 RCLONE_VERSION="1.74.3"
 RCLONE_DEB_SHA256_AMD64="408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc"
@@ -861,7 +939,7 @@ fetch_lib() {
   fi
   if [[ $auth_hint != password ]]; then
     out="$(timeout "${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}" \
-      scp -v -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes \
+      scp -v -P "$port" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o BatchMode=yes \
         "${cm_opts[@]}" "${key_id_opt[@]}" \
         "${helper}:${LIB_REMOTE}" ./helper-lib.sh 2>&1)"; rc=$?
     if [[ $rc -eq 0 && -s ./helper-lib.sh ]]; then
@@ -994,7 +1072,7 @@ hook_probe_transport() {   # stdin: sftp `get` lines -> transcript on stdout, th
   cmds="$(cat)"; hook_probe_via=""
   if [[ $auth_hint != password ]]; then
     out="$(printf '%s\n' "$cmds" | sed 's/^/-/' | timeout "$t" \
-      sftp -v -b - -P "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes \
+      sftp -v -b - -P "$port" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o BatchMode=yes \
         "${cm_opts[@]}" "${key_id_opt[@]}" "$helper" 2>&1)"; rc=$?
     if [[ $rc -eq 0 ]]; then hook_probe_via=key; printf '%s\n' "$out"; return 0; fi
     case "$(classify_ssh_failure "$out" "$rc")" in transport|banned) printf '%s\n' "$out"; return "$rc";; esac
@@ -1182,7 +1260,7 @@ hook_fetch_pinned_lib() {
   tries="${PROVISIONER_HOOK_LIB_TRIES:-12}"
   for ((try = 1; try <= tries; try++)); do
     if command -v curl >/dev/null 2>&1; then
-      curl -fsSL --proto "${PROVISIONER_HOOK_LIB_PROTO:-=https}" --proto-redir '=https' --connect-timeout 15 --max-time 120 -o "$tmp" "$url" 2>/dev/null || : > "$tmp"
+      curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 -o "$tmp" "$url" 2>/dev/null || : > "$tmp"
     else
       wget -q --https-only -T 60 -O "$tmp" "$url" 2>/dev/null || : > "$tmp"
     fi
@@ -1209,7 +1287,7 @@ hook_select_lib() {
     log "helper-lib.sh is NOT hash-pinned: this hook carries no baked sha256 (a run from a checkout) - using the checkout's own ${here}/helper-lib.sh"
     return 0
   fi
-  log "helper-lib.sh is NOT hash-pinned: this hook carries no baked sha256 and no checkout sits beside it - sourcing the helper's copy unverified"
+  die "this copy of the hook has no checksum for its helper library baked in, and there is no checked copy of helper-lib.sh beside it, so it will not run the library the helper serves (that would run as root, unchecked). Run the one-liner from the install guide (docs/handbook/FIRST-BOOTSTRAP.md) to get the published hook, or run this hook from a checkout of the repository in another directory."
 }
 hook_select_lib
 . ./helper-lib.sh
