@@ -43,6 +43,11 @@
 # shellcheck disable=SC2034  # EXCL_* / SRC_* are read through indirect names
 set -euo pipefail
 
+# err-trap (#1719): an unchecked failed command is reported as a WARN on stderr; it never stops the script.
+_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../bootstrap/err-trap.sh"
+# shellcheck source=../bootstrap/err-trap.sh
+[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
+
 REMOTE_ROOT=/srv/dev
 # DEVCOPY_REMOTE_ROOT exists for the test suite only (it sets DEVCOPY_TEST=1); otherwise ignored.
 if [ -n "${DEVCOPY_REMOTE_ROOT:-}" ]; then
