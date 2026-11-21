@@ -81,11 +81,6 @@
 #
 set -uo pipefail
 
-# err-trap (#1719): this script runs where bootstrap/err-trap.sh is not (deployed, or before the repo exists), so the
-# WARN-and-carry-on trap is inlined: name-only, saved stderr, set -E so functions inherit; it never stops the script.
-set -E; exec {_et_fd}>&2 || _et_fd=2
-trap 'case "${BASH_COMMAND%%[=[:space:]]*}" in "["|"[["|test|"((") ;; *) printf "WARN  %s:%s: unchecked command failed (exit %s), carrying on: %s (arguments not shown)\n" "${0##*/}" "$LINENO" "$?" "${BASH_COMMAND%%[=[:space:]]*}" >&"$_et_fd" ;; esac' ERR
-
 # ── Layout ────────────────────────────────────────────────────────────────────
 STATE_DIR="/etc/provisioner"
 HELPER_FILE="${STATE_DIR}/helper"          # written by needle.sh

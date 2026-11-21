@@ -33,11 +33,6 @@
 # A box that comes up wrong has nothing on it: reinstall from the panel and run again.
 set -uo pipefail
 
-# err-trap (#1719): an unchecked failed command is reported as a WARN on stderr; it never stops the script.
-_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/err-trap.sh"
-# shellcheck source=err-trap.sh
-[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
-
 ROOT="${DEBIAN_TO_PVE_PROBE_DIR:-}"
 PORT_NAME=nic0   # our own name for the uplink card, pinned by MAC (#1237)
 LINK_FILE="${ROOT}/etc/systemd/network/10-provisioner-uplink.link"
@@ -601,12 +596,12 @@ ata_trouble() {  # <whole-disk names...>: counts the kernel's ATA complaints sin
   local kl p n d dl list="" ata
   kl="$(mktemp)" || return 0; kernel_log "$kl"
   for p in 'failed command' 'SError' 'CommWake' 'failed to IDENTIFY' 'Disk failure on' 'kicking non-fresh'; do
-    n="$(grep -c -- "$p" "$kl" || true)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n="$(grep -c -- "$p" "$kl")"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
     list=""
     if (( n > 0 )); then
       for d in "$@"; do
         ata="$(readlink -m "${ROOT}/sys/block/${d}" 2>/dev/null | grep -o '/ata[0-9]*/' | head -n1 | tr -d /)"
-        dl="$(grep -- "$p" "$kl" | grep -cE "(^|[^a-z0-9])${d}[0-9]*([^a-z0-9]|$)${ata:+|(^|[^a-z0-9])${ata}[.:]}" || true)"
+        dl="$(grep -- "$p" "$kl" | grep -cE "(^|[^a-z0-9])${d}[0-9]*([^a-z0-9]|$)${ata:+|(^|[^a-z0-9])${ata}[.:]}")"
         (( dl > 0 )) && list+=" ${d}=${dl}"
       done
     fi
