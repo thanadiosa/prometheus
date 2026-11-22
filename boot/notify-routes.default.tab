@@ -159,6 +159,9 @@ power.report           yes  normal    -
 # are sent only when the reboot will really happen / is really waiting; neither carries an address.
 reboot.warning         yes  normal    -
 reboot.due             yes  normal    -
+host.pool.critical     yes  high      -      # the VM disk pool is past its critical percentage (#1706)
+host.pool.warning      yes  normal    -      # ... past its warning percentage
+host.pool.recovered    yes  normal    -      # ... and back under it
 host.disk.locked       yes  high      -      # the box's disks are locked: the machines are OFF (#1609)
 host.disk.unlocked     yes  normal    -
 
@@ -371,6 +374,10 @@ maintenance.jenkins.login_failed yes  normal    -
 # `disk.low` (issue #1649) -- the control node's disk is still under the warning size AFTER the nightly
 # cleanup; the job server takes itself offline near 1 GiB free. NORMAL: there is usually time to act.
 maintenance.disk.low             yes  normal    -
+# `disk.critical` and `disk.recovered` (issue #1725) -- the same disk past the critical percentage (updates and
+# rebuilds are about to fail for lack of space: HIGH), and back under the warning percentage (NORMAL).
+maintenance.disk.critical        yes  high      -
+maintenance.disk.recovered       yes  normal    -
 # `pin_move.skipped` and `pin_move.not_run` (issue #1568) -- the daily trial run of new job server and add-on
 # versions: a version failed it and was skipped, or the trial could not run or could not tell. Nothing was
 # changed in either case; a pin that stays behind is the cost, so NORMAL. Success is quiet.

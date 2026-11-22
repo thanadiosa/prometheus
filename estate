@@ -17,6 +17,11 @@
 # agent, never from argv or a file. Needs ssh (+ssh-keyscan), curl and dig (mount: rclone and FUSE); bash 3.2 is
 # enough, so it runs on a stock macOS.
 # Install or update: curl -fsSL <mirror>/estate -o ~/bin/estate && chmod +x ~/bin/estate
+# err-trap (#1719): an unchecked failed command is reported as a WARN on stderr; it never stops the script.
+_et="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../bootstrap/err-trap.sh"
+# shellcheck source=../bootstrap/err-trap.sh
+[[ -r $_et ]] && . "$_et"; declare -F err_trap_install >/dev/null && err_trap_install; unset _et
+
 ESTATE_REV=2026110909
 set -uo pipefail
 export LC_ALL=C   # the name and address checks use plain ASCII ranges
@@ -189,15 +194,20 @@ probe_entry() {   # <label> <alias>
 }
 
 # The address comes from unauthenticated DNS, so it is checked BEFORE any secret is read:
-# https only, a plain host name inside the zone, no userinfo, no odd characters.
-jenkins_url_ok() {   # <url> -> 0 when it may be contacted and may carry a login
-  local url="$1" rest host
+# https only, a plain host name, no userinfo, no odd characters, and the host is either inside the zone OR exactly
+# jenkins.<domain> where <domain> is the estate's own public domain as named by the domain= entry of the SAME record
+# (an estate whose domain lives outside our zone, #1750). Any other host is refused.
+jenkins_url_ok() {   # <url> [<domain>] -> 0 when it may be contacted and may carry a login
+  local url="$1" own="${2:-}" rest host
   case "$url" in https://*) ;; *) return 1 ;; esac
   case "$url" in *[!A-Za-z0-9:/._?#%=\&+~-]*) return 1 ;; esac
   rest="${url#*://}"; host="${rest%%[/?#]*}"
   case "$host" in *:*) case "${host##*:}" in ''|*[!0-9]*) return 1 ;; esac; host="${host%:*}" ;; esac
   case "$host" in ''|*[!a-z0-9.-]*|.*|*..*) return 1 ;; esac
   case "$host" in *".${ZONE}") return 0 ;; esac
+  case "$own" in ''|*[!a-z0-9.-]*|.*|*..*|*.|-*|*-.*|*.-*) return 1 ;; esac
+  case "$own" in *.*) ;; *) return 1 ;; esac
+  [ "$host" = "jenkins.${own}" ] && return 0
   return 1
 }
 
@@ -209,12 +219,18 @@ keyring_value_ok() {   # <value>
   return 1
 }
 
-probe_jenkins() {   # <estate> <url>
-  local name="$1" url="$2" code="" secret="" rc=1 raw note=""
-  jenkins_url_ok "$url" || { printf 'job server: unknown - the jenkins= address in the DNS record is not an https address inside the zone, so it was not contacted\n'; return 1; }
+probe_jenkins() {   # <estate> <url> [<domain>]
+  local name="$1" url="$2" own="${3:-}" code="" secret="" rc=1 raw note=""
+  jenkins_url_ok "$url" "$own" || { printf 'job server: unknown - the jenkins= address in the DNS record is not an https address inside the zone or at jenkins.<the estate domain named in that record>, so it was not contacted\n'; return 1; }
+  local rest="${url#*://}" jhost; jhost="${rest%%[/?#]*}"; jhost="${jhost%%:*}"
   if [ "$DNS_UNVERIFIED" != 0 ]; then
     note="not signed in: the records came from your resolver and are not trusted with a login"
   else
+    # the login goes only to a host inside our zone: an address outside it (an estate on its own domain, #1750)
+    # is probed without a login, whoever names it
+    case "$jhost" in *".${ZONE}") ;; *) note="not signed in: this host is outside our DNS zone" ;; esac
+  fi
+  if [ -z "$note" ]; then
     raw="$(keyring_get "${name}-jenkins")"; rc=$?
     if [ "$rc" = 0 ]; then
       if keyring_value_ok "$raw"; then secret="$raw"
@@ -247,7 +263,7 @@ probe_jenkins() {   # <estate> <url>
 }
 
 cmd_status() {
-  local name="$1" txt jenkins_url="" kv bad=0 rec
+  local name="$1" txt jenkins_url="" own_domain="" kv bad=0 rec
   have dig || die "dig is not installed (it reads the estate's DNS records)"
   have ssh || die "ssh is not installed"
   have ssh-keyscan || die "ssh-keyscan is not installed (it comes with ssh)"
@@ -259,6 +275,7 @@ cmd_status() {
   for kv in $txt; do
     case "$kv" in
       jenkins=*) jenkins_url="${kv#jenkins=}" ;;
+      domain=*) own_domain="$(printf '%s' "${kv#domain=}" | tr 'A-Z' 'a-z')" ;;
     esac
   done
   [ "$DNS_UNVERIFIED" = 0 ] || printf "note: the zone's own name servers did not answer; these records came from your resolver and may be stale\n" >&2
@@ -268,7 +285,7 @@ cmd_status() {
     printf 'job server: unknown - the DNS record %s (TXT) is missing, so no address is known\n' "$rec"
     bad=1
   elif [ -z "$jenkins_url" ]; then printf 'job server: unknown - the record %s has no jenkins=<address> entry\n' "$rec"; bad=1
-  else probe_jenkins "$name" "$jenkins_url" || bad=1; fi
+  else probe_jenkins "$name" "$jenkins_url" "$own_domain" || bad=1; fi
   mirror_notice
   return "$bad"
 }
@@ -443,7 +460,7 @@ cmd_umount() {
 # mirror, NEXT TO THIS FILE, and run only when its sha256 equals the value carried here. A changed file (a hijacked
 # mirror, a bad mirror run, a mover newer than this copy) is refused and named; the cure is the install line again.
 # tests/estate_laptop.sh checks this value against the committed mover, so the two cannot drift apart.
-MOVER_SHA256="8c4b39b301a242f97dac31a3ef858b2fc676fc33f629545e96847d52571a6bee"
+MOVER_SHA256="29b2f3854b3e8684d20c76758f13f40e9a2dd2f21dc081b66faac3890fb088e7"
 MOVER_URL="${MIRROR_URL%/*}/dev-container-move.sh"
 
 sha256_of() {   # <file> -> the hex digest on stdout
