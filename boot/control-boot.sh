@@ -295,15 +295,19 @@ else
   estate=""
   log "WARN: ${ESTATE_FILE} missing (older needle snippet?) — pipeline will use its default estate"
 fi
+# #1772 (M13): the estate name becomes a secrets-folder path component; refuse anything but a plain
+# lower-case name HERE, before any path is built (the one rule: bin/new-estate.sh, the orchestrator and estate_format all use it).
+[[ -z ${estate:-} || ${estate} =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
+  || die "invalid estate name '${estate}' - must be a plain lower-case name (letters, digits, '-')"
 
 # ── THE LAP WAS STARTED FOR THE WRONG ESTATE (issue #789) ─────────────────────
 # THE BACKSTOP, not the primary check. hook.sh catches this pair on the PVE console before it
-# fetches a single byte (see the long note there for the live iapetus failure this exists to
+# fetches a single byte (see the long note there for the live failure on one estate this exists to
 # replace); this copy is for the node whose hook PREDATES that check — a lap driven by an
 # older console one-liner, or a re-run of this script by hand. The two facts arrive here in
 # two files written side by side by needle.sh, ${ESTATE_FILE} and ${REMOTE_DIR_FILE}, and
-# until now nothing ever read them together: on iapetus one said `iapetus` and the other ended
-# in `epimetheus`, and the first thing to notice was the vault refusing a password that was
+# until now nothing ever read them together: on one estate one said `<estate>` and the other ended
+# in `<other-estate>`, and the first thing to notice was the vault refusing a password that was
 # entirely correct for the estate it had been fetched from.
 #
 # It runs HERE, before the deploy key, before the credential wait, and before anything under
@@ -423,7 +427,7 @@ fi
 # IPv4-only (the control node has no IPv6 route before OPNsense exists), but the
 # helper may be dual-stacked (an AAAA record). Without this, ssh/scp tries the
 # helper's IPv6 address first and burns ~127s per connection on a dead SYN before
-# falling back to IPv4 — observed on the menoetius cold-start as a fixed ~135s
+# falling back to IPv4 — observed on the production estate cold-start as a fixed ~135s
 # stall on EACH secret pull. One ssh_config drop-in covers the deploy-key pull below,
 # control-init.sh's remaining secret pulls AND run-pipeline's state push/pull (all use
 # the ssh/scp CLI, which reads it).

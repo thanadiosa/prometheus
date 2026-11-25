@@ -197,7 +197,7 @@ validation.failed      yes  normal    -
 # lands seconds later carrying the sentence that puts it in context — "the build succeeded, only
 # the post-build checks stopped early" — and it is the only ping that CAN say that, because it
 # is the only one emitted after the lap is over. Routed here as well, this row would buy the
-# operator two pushes for one outcome, which is exactly what happened on epimetheus 2026-08-21:
+# operator two pushes for one outcome, which is exactly what happened on one estate 2026-08-21:
 # the same "no verdict" sentence twice, a minute apart. Kept as its OWN row rather than left to
 # fall through `validation.*` so that flipping the family row can never silently re-create the
 # duplicate; the call site also passes --record-only, so this row states the intent as much as
@@ -230,7 +230,7 @@ validation.*           no   normal    -      # done: log-only, the verdict rides
 autotest.passed        yes  normal    -
 
 # ── The router came up (or is about to come up) with no configuration (issue #125)
-# `opnsense.unconfigured` is the one the 2026-08-08 iapetus lap needed and did not have: the
+# `opnsense.unconfigured` is the one the 2026-08-08 nested-estate lap needed and did not have: the
 # router VM is being created with NO first-boot config ISO, so it will boot the bare baked
 # template — no VLANs, no addresses, no routing — and the whole lap is already lost. HIGH,
 # because it is emitted ~90 minutes before the failure it guarantees, and acting on it saves

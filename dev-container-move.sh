@@ -138,7 +138,7 @@ PARTIAL=""
 cleanup() {
   # Staging on the server holds logins: remove it on every exit path (best effort).
   if [ "$CMD" != remove ] && [ -f "$SSHCFG" ] && [ "${STAGED:-0}" = 1 ]; then
-    ssh -F "$SSHCFG" "$TARGET" "rm -rf $(sq "$STAGE_REMOTE")" >/dev/null 2>&1 || \
+    ssh -F "$SSHCFG" -- "$TARGET" "rm -rf $(sq "$STAGE_REMOTE")" >/dev/null 2>&1 || \
       log "could not remove ~/${STAGE_REMOTE} on the server; delete it by hand (it holds logins)"
   fi
   [ -z "$PARTIAL" ] || rm -rf "$PARTIAL"   # a half-fetched folder is never left under a dated name
@@ -161,7 +161,8 @@ write_ssh_config() {
     printf '  ConnectTimeout 15\n  ControlMaster auto\n  ControlPath %s/cm\n  ControlPersist 10\n' "$WORK"
     printf 'Include ~/.ssh/config\n'; } >"$SSHCFG"
 }
-rsh() { ssh -F "$SSHCFG" "$@"; }
+# `--` ends ssh's options before the target (an operator-typed name must never be read as an option); only -t may lead.
+rsh() { local o=(); while [ "${1:-}" = -t ]; do o+=(-t); shift; done; ssh -F "$SSHCFG" ${o[@]+"${o[@]}"} -- "$@"; }
 
 # A failed connection (host key, network, login) is reported as that, with ssh's own last line,
 # never as "no folders" (#1166).

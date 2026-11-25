@@ -18,7 +18,7 @@
 #   • The reference helper (openssh sftp-server, chrooted) answers KEY auth AND the exec
 #     channel — `ssh helper 'mkdir -p / test -f / mv / rm'` works, the efficient path the
 #     boot chain historically hardcoded.
-#   • A seedbox helper (proftpd mod_sftp — the iapetus helper) answers NEITHER: pubkey is
+#   • A seedbox helper (proftpd mod_sftp — one estate's helper) answers NEITHER: pubkey is
 #     rejected (PASSWORD only) and the exec channel is refused ("exec request failed on
 #     channel 0"). It is SFTP-ONLY.
 # So instead of hardcoding one, this lib PROBES the live helper once per process and
@@ -73,7 +73,7 @@
 # We used to shell out to `sshpass -f <passfile>`, which meant the FIRST thing a bare
 # Proxmox box had to do was `apt-get install sshpass` — i.e. the whole boot chain hung off
 # a working apt + outbound internet on a host whose repos may not even be configured. That
-# timed out live on iapetus (2026-08-07) and blocked the run at step one, and it was load-
+# timed out live on one estate (2026-08-07) and blocked the run at step one, and it was load-
 # bearing: no sshpass ⇒ no helper ⇒ no needle ⇒ nothing.
 #
 # OpenSSH already supplies a password with NO external tool: SSH_ASKPASS names a program,
@@ -160,7 +160,7 @@ HELPER_PROBE_TIMEOUT="${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}"
 # size-only check, so a multi-GB seed is never round-tripped. Env-overridable; default 64 KiB.
 HELPER_PUT_VERIFY_MAX="${PROVISIONER_HELPER_PUT_VERIFY_MAX:-65536}"
 
-# Cipher/MAC pin for EVERY helper ssh/sftp op. WHY: the iapetus seedbox helper (proftpd
+# Cipher/MAC pin for EVERY helper ssh/sftp op. WHY: one estate's seedbox helper (proftpd
 # mod_sftp) CORRUPTS any transfer >~1KB under the default cipher/MAC negotiation — SFTP
 # reads fail with "message authentication code incorrect" (the default encrypt-then-MAC
 # combo is what corrupts; NIC offload/MTU ruled out on the box). Forcing aes128-ctr +
@@ -171,13 +171,18 @@ HELPER_PUT_VERIFY_MAX="${PROVISIONER_HELPER_PUT_VERIFY_MAX:-65536}"
 HELPER_CIPHERS="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}"
 HELPER_MACS="${PROVISIONER_HELPER_MACS-hmac-sha2-256}"
 
-# Options common to every ssh/scp/sftp to the helper. accept-new HONOURS a host key
-# already pinned in known_hosts (verifies against it, refuses on a mismatch) rather than
-# re-trusting: genesis.sh bakes the pin into the first control image
-# (bootstrap/genesis.sh:414-431) and bake-nextgen carries it into every later seed
-# (ansible/roles/bake-nextgen/tasks/main.yml:104-169), so this option is a first-contact
-# TOFU only for a seed that genuinely shipped without a baked pin (review S5, closed).
-_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+# Options common to every ssh/scp/sftp to the helper: the seedbox's identity must ALREADY be recorded
+# in known_hosts, and an unknown or different one is refused (never trusted on first sight). The record comes
+# from the boot chain: the hook checks the fingerprint before any password is sent and the PVE host's needle
+# hands that public key to the control node in its first-boot data (control-init.sh records it); genesis.sh
+# bakes the pin into the first control image and bake-nextgen carries it into every later seed. A node that
+# has none stops here with the line _helper_log_no_auth prints. Trusting the first answer is an explicit,
+# loud opt-in only: PROVISIONER_HELPER_TOFU=1 (the same switch the hook has).
+_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=yes -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+if [ "${PROVISIONER_HELPER_TOFU:-}" = 1 ]; then
+  _HELPER_SSH_OPTS[1]="StrictHostKeyChecking=accept-new"
+  printf '[helper-lib] WARNING: PROVISIONER_HELPER_TOFU=1 - the seedbox identity is trusted on first sight, so a machine on the path gets whatever is sent to it. Record the identity and drop this.\n' >&2
+fi
 [ -n "$HELPER_CIPHERS" ] && _HELPER_SSH_OPTS+=(-o Ciphers="$HELPER_CIPHERS")
 [ -n "$HELPER_MACS" ] && _HELPER_SSH_OPTS+=(-o MACs="$HELPER_MACS")
 
@@ -460,10 +465,10 @@ _helper_sftp_run() {
     # here, deliberately — see the password-sftp invariant at the top of this file.
     _helper_pass_run sftp \
       -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER"
+      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER"
   else
     "${to[@]}" sftp -i "$HELPER_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes \
-      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER"
+      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER"
   fi
 }
 
@@ -542,7 +547,7 @@ _helper_sftp_said() {
 #
 # ── THE WHOLE TOKEN FIRST, AND WHY THE ORDER IS THE WHOLE FIX ─────────────────────────
 # The first cut of this function replaced only the HOST half, which turned
-# `iapetus@helper.iapetus.dedyn.io` into `iapetus@HELPER` — and that token is invisible to
+# `<account>@<helper host>` into `<account>@HELPER` — and that token is invisible to
 # BOTH of scrub-log.py's defences downstream. Its `_USER_AT_HOST_RE` requires a DOTTED host
 # to the right of the `@`, and `HELPER` has no dot; its verbatim-literal pass is a substring
 # match for the exact `user@host` value, which no longer appears anywhere. Measured against
@@ -602,10 +607,10 @@ _helper_ssh_raw() {
     # _helper_pass_run owns the timeout prefix on this branch (issue #104).
     _helper_pass_run ssh -n \
       -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" "$@"
+      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" "$@"
   else
     "${to[@]}" ssh -n -i "$HELPER_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes \
-      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" "$@"
+      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" "$@"
   fi
 }
 
@@ -659,7 +664,7 @@ _HELPER_AUTH_RE='permission denied ?\(|permission denied, please|authentication 
 # this file exists to prevent, arrived at from the opposite direction.
 #
 # `message authentication code incorrect` belongs HERE and not in the refusal set: it is the
-# documented iapetus-seedbox corruption (see HELPER_CIPHERS above), it is a property of the
+# documented seedbox-helper corruption (see HELPER_CIPHERS above), it is a property of the
 # link and not a decision the helper made, and it is the one shape a retry genuinely fixes.
 # Before #897 it matched nothing at all, so a corrupted download exited 0, wrote a damaged
 # file, and helper_get's `[ -f dst ]` backstop called that a success.
@@ -745,7 +750,7 @@ _helper_auth_probe() {
   if [ -z "$(_helper_auth_skip_reason key)" ]; then
     if printf 'quit\n' | timeout -k 5 "$HELPER_PROBE_TIMEOUT" sftp -i "$HELPER_KEY" -o IdentitiesOnly=yes \
          -o PreferredAuthentications=publickey -o BatchMode=yes \
-         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
+         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
       printf 'key'; return 0
     fi
   fi
@@ -757,7 +762,7 @@ _helper_auth_probe() {
     [ -z "${_HELPER_PROBE_ERRF:-}" ] || : > "$_HELPER_PROBE_ERRF"
     if printf 'quit\n' | _HELPER_OP_TIMEOUT="$HELPER_PROBE_TIMEOUT" _helper_pass_run sftp \
          -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
+         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
       printf 'password'; return 0
     fi
   fi
@@ -842,6 +847,11 @@ _helper_reach() {
 # whatever the auth configuration was. #143's distinction is the thing this must not disturb.
 _helper_log_no_auth() {
   local reach port_note key_skip pw_skip tried lead
+  if [ "${_HELPER_HOSTKEY_REFUSED:-0}" = 1 ]; then
+    # The connection was refused on the seedbox's IDENTITY, before any credential was sent: not an auth or reach fault.
+    _helper_log "the seedbox's identity is not the one recorded on this host (or none is recorded), so NOTHING was sent to it. The record comes from the fingerprint the boot hook verified; if an old entry is wrong remove it with ssh-keygen -R <seedbox name>, then record the verified key (or run the hook again with PROVISIONER_HELPER_FINGERPRINT set)."
+    return 0
+  fi
   if [ "$HELPER_PORT_SRC" = default ]; then
     port_note="port ${HELPER_PORT} is this lib's DEFAULT — nothing set PROVISIONER_HELPER_PORT for this run, so a helper listening anywhere else fails here with the credentials untouched"
   else
@@ -914,7 +924,7 @@ helper_detect() {
   # run-pipeline's self-log ships these lines off-box (issue #84).
   # _HELPER_DETECT_REFUSED=1 = the last login offered was REFUSED (auth wording, never logged): helper_get maps it to its
   # "refused" rc 2 so a retrying caller stops (#1201). Every other failure stays rc 1.
-  local auth errf; _HELPER_DETECT_REFUSED=0
+  local auth errf; _HELPER_DETECT_REFUSED=0; _HELPER_HOSTKEY_REFUSED=0
   errf="$(umask 077; mktemp "${TMPDIR:-/tmp}/prov-probe.XXXXXX" 2>/dev/null)" || errf=""
   _HELPER_PROBE_ERRF="$errf"
   if _helper_crypt_alias; then   # #1203: the access path signs in once, through rclone - no raw sftp/ssh probe
@@ -923,7 +933,8 @@ helper_detect() {
     auth="$_HELPER_AUTH"
   else
   auth="$(_helper_auth_probe)" || {
-    [ -z "$errf" ] || { grep -qiE "$_HELPER_AUTH_RE" "$errf" 2>/dev/null && _HELPER_DETECT_REFUSED=1; rm -f "$errf"; }
+    [ -z "$errf" ] || { grep -qiE 'host key verification failed|REMOTE HOST IDENTIFICATION' "$errf" 2>/dev/null && _HELPER_HOSTKEY_REFUSED=1
+      grep -qiE "$_HELPER_AUTH_RE" "$errf" 2>/dev/null && _HELPER_DETECT_REFUSED=1; rm -f "$errf"; }
     _HELPER_PROBE_ERRF=""; _helper_log_no_auth; return 1; }
   [ -z "$errf" ] || rm -f "$errf"
   _HELPER_PROBE_ERRF=""
@@ -1018,9 +1029,9 @@ _helper_crypt_on() {
   _helper_crypt_keyed && return 0
   _helper_crypt_alias
 }
-# The host key must be VERIFIED as strictly as today's accept-new path: TOFU on first contact,
-# then refuse a mismatch. rclone only verifies when given known_hosts_file (and has no
-# accept-new), so seed the entry with the same ssh probe, then refuse if it is still absent.
+# The host key must be RECORDED already: rclone only verifies when given known_hosts_file, and a strict ssh probe
+# can record nothing, so a machine with no entry for the seedbox is refused with the way to record the verified key
+# (no trust on first sight; PROVISIONER_HELPER_TOFU=1 alone makes the probe record the first answer).
 # Hostspec = the ONE shared rule, bootstrap/known_hosts_hostspec.sh (#780), run as `sh`.
 _HELPER_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 _helper_crypt_khfile() { printf '%s' "${HOME:-/root}/.ssh/known_hosts"; }
@@ -1039,11 +1050,16 @@ _helper_crypt_hostkey() {
     || spec="$(_helper_hostspec_inline "$host" "$HELPER_PORT")" && [ -n "$spec" ] \
     || { _helper_log "crypt mode: cannot compute the known_hosts name (bootstrap/known_hosts_hostspec.sh unreadable) — refusing"; return 2; }
   ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
-  mkdir -p "$(dirname "$kh")" 2>/dev/null
-  ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o PubkeyAuthentication=no \
-      -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" true >/dev/null 2>&1
-  ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
-  _helper_log "crypt mode: no host key on record for HELPER in '${kh}' and first contact did not record one — refusing to talk to an unverified host"
+  # The access path signs in through rclone, which verifies only against a RECORDED key. The strict options cannot
+  # record one, so a machine with no entry stops here with the way to record the verified one. Recording it by
+  # probing is the explicit opt-in only (PROVISIONER_HELPER_TOFU=1: the first answer is trusted, said loudly above).
+  if [ "${PROVISIONER_HELPER_TOFU:-}" = 1 ]; then
+    mkdir -p "$(dirname "$kh")" 2>/dev/null
+    ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o PubkeyAuthentication=no \
+        -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" true >/dev/null 2>&1
+    ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
+  fi
+  _helper_log "crypt mode: no seedbox host key is recorded in '${kh}', so nothing is sent to it. Record the VERIFIED key: take the fingerprint from the estate's published record (the hostkey= value of its _helper.<estate> name, read through estate-connect) or from the hook that built this estate, then on this machine run: ssh-keyscan -p ${HELPER_PORT} <seedbox name> > key.txt; ssh-keygen -lf key.txt (it must print that fingerprint); cat key.txt >> '${kh}'. Or set PROVISIONER_HELPER_TOFU=1 to trust the first answer (not recommended)."
   return 2
 }
 # #1202: without a key an ENCRYPTED folder lists as encrypted names, and a missing plain name would read as
@@ -1081,7 +1097,7 @@ _helper_crypt_ready() {
 _helper_crypt_obscure() { sed -n "${2}p" "$1" | tr -d '\r' | rclone obscure - 2>/dev/null; }
 # The sftp stanza. A function of its own so tests can swap in rclone's local backend.
 # rclone's Go client offers its own host-key order, not OpenSSH's, so a key first recorded by ssh
-# (accept-new) can mismatch (#1155): offer exactly the types recorded for this host. None => no line.
+# (recorded earlier by the hook or the image) can mismatch (#1155): offer exactly the types recorded for this host. None => no line.
 _helper_crypt_hostkey_algs() {
   local kh h spec t out=""; kh="$(_helper_crypt_khfile)"; h="${HELPER#*@}"
   case "$HELPER_PORT" in ""|22) spec="$h" ;; *) spec="[$h]:$HELPER_PORT" ;; esac

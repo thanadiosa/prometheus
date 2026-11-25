@@ -23,6 +23,8 @@ REPO_DIR="${PROVISIONER_REPO_DIR:-/opt/provisioner}"
 REPO_URL="git@github.com:parrhasia/prometheus.git"
 NEEDLE_MAIN="${REPO_DIR}/bootstrap/needle.sh"       # what we hand off to
 estate="${PROVISIONER_ESTATE:-$(hostname -s 2>/dev/null || true)}"
+[[ -z ${estate:-} || ${estate} =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
+  || { printf '\n[hook] ERROR: invalid estate name %q - must be a plain lower-case name (letters, digits, -)\n' "${estate}" >&2; exit 1; }
 HELPER_AUTH_CACHE="/root/helper-auth"
 
 case "${PROVISIONER_VERBOSE:-0}" in
@@ -144,7 +146,7 @@ Nothing has been changed on this host."
     [[ -n $embedded_port || -n $embedded_rd ]] \
       && log "combined helper form: address='${helper}'${embedded_port:+ port='${embedded_port}'}${embedded_rd:+ remote-dir='${embedded_rd}'}"
   fi
-  if [[ ! $helper =~ ^[A-Za-z0-9._@-]+@[A-Za-z0-9._-]+$ ]]; then
+  if [[ ! $helper =~ ^[A-Za-z0-9._@][A-Za-z0-9._@-]*@[A-Za-z0-9._-]+$ ]]; then
     case "$helper_src" in
       env)   die "PROVISIONER_HELPER='${helper}' is not user@host — fix it and re-run. Nothing has been changed.";;
       cache) say "cached helper '${helper}' is not user@host — discarding it and asking"; rm -f "$HELPER_CACHE";;
@@ -194,15 +196,27 @@ Nothing has been changed on this host."
   break
 done
 
+hook_dns_txt_signed() {
+  local name="$1" out
+  local filt='s/^[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+IN[[:space:]]+TXT[[:space:]]+//p'
+  command -v delv >/dev/null 2>&1 || return 0
+  out="$(timeout 20 delv -t TXT "$name" 2>/dev/null)"
+  if grep -qx '; fully validated' <<<"$out"; then
+    sed -n -E "$filt" <<<"$out" | tr -d '"'
+  fi
+  return 0
+}
 hook_published_fp() {
   local name txt tok v=""
   [[ $helper_server == helper.?* ]] || return 0
   name="_${helper_server}"
-  if command -v dig >/dev/null 2>&1; then
-    txt="$(dig +short +time=3 +tries=2 TXT "$name" 2>/dev/null | tr -d '"')"
-  elif command -v host >/dev/null 2>&1; then
-    txt="$(host -W 3 -t TXT "$name" 2>/dev/null | sed -n 's/.* descriptive text //p' | tr -d '"')"
-  else
+  if ! command -v delv >/dev/null 2>&1; then
+    warn "the signed-lookup tool (delv, from the bind9 dnsutils package) is not installed on this machine, so the fingerprint published in DNS cannot be checked and is not used; the fingerprint must be typed (the normal path on a fresh box)."
+    return 0
+  fi
+  txt="$(hook_dns_txt_signed "$name")"
+  if [[ -z $txt ]]; then
+    warn "no DNSSEC-validated record for the helper's fingerprint was found (unsigned, unvalidated or absent), so it is not used; the fingerprint must be typed."
     return 0
   fi
   for tok in $txt; do
@@ -585,13 +599,13 @@ hook_sftp_pass() {
     chmod 700 "$ap" || { rm -f "$ap"; return 255; }
     PROVISIONER_ASKPASS_FILE="$HELPER_PASS_FILE" SSH_ASKPASS="$ap" \
     SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-}" \
-      "${hook_sftp_to[@]}" sftp "${sftp_opts[@]}" "$helper" 2>&1
+      "${hook_sftp_to[@]}" sftp "${sftp_opts[@]}" -- "$helper" 2>&1
     rc=$?
     rm -f "$ap"
     return $rc
   fi
   if command -v sshpass >/dev/null 2>&1; then
-    "${hook_sftp_to[@]}" sshpass -f "$HELPER_PASS_FILE" sftp "${sftp_opts[@]}" "$helper" 2>&1
+    "${hook_sftp_to[@]}" sshpass -f "$HELPER_PASS_FILE" sftp "${sftp_opts[@]}" -- "$helper" 2>&1
     return $?
   fi
   if hook_askpass_ok; then
@@ -680,7 +694,8 @@ HELPER_PASS_FILE="${PROVISIONER_HELPER_PASS_FILE:-/etc/provisioner/helper-pass}"
 HELPER_CONNECT_TIMEOUT="${PROVISIONER_HELPER_CONNECT_TIMEOUT:-15}"
 HELPER_CIPHERS="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}"
 HELPER_MACS="${PROVISIONER_HELPER_MACS-hmac-sha2-256}"
-_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=yes -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+[ "${PROVISIONER_HELPER_TOFU:-}" = 1 ] && _HELPER_SSH_OPTS[1]="StrictHostKeyChecking=accept-new"   # explicit, loud opt-in only (the hook warns when it takes it)
 [ -n "$HELPER_CIPHERS" ] && _HELPER_SSH_OPTS+=(-o Ciphers="$HELPER_CIPHERS")
 [ -n "$HELPER_MACS" ] && _HELPER_SSH_OPTS+=(-o MACs="$HELPER_MACS")
 _HELPER_AUTH=""
@@ -775,7 +790,7 @@ _crypt_hostkey() {
   ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
   mkdir -p "$(dirname "$kh")" 2>/dev/null
   ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o PubkeyAuthentication=no \
-      -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" true >/dev/null 2>&1
+      -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" true >/dev/null 2>&1
   ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1
 }
 
@@ -941,7 +956,7 @@ fetch_lib() {
     out="$(timeout "${PROVISIONER_HELPER_PROBE_TIMEOUT:-25}" \
       scp -v -P "$port" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o BatchMode=yes \
         "${cm_opts[@]}" "${key_id_opt[@]}" \
-        "${helper}:${LIB_REMOTE}" ./helper-lib.sh 2>&1)"; rc=$?
+        -- "${helper}:${LIB_REMOTE}" ./helper-lib.sh 2>&1)"; rc=$?
     if [[ $rc -eq 0 && -s ./helper-lib.sh ]]; then
       hook_note_verified_id "$out"     # read the winner off the conversation that just worked
       return 0
@@ -1073,7 +1088,7 @@ hook_probe_transport() {   # stdin: sftp `get` lines -> transcript on stdout, th
   if [[ $auth_hint != password ]]; then
     out="$(printf '%s\n' "$cmds" | sed 's/^/-/' | timeout "$t" \
       sftp -v -b - -P "$port" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o BatchMode=yes \
-        "${cm_opts[@]}" "${key_id_opt[@]}" "$helper" 2>&1)"; rc=$?
+        "${cm_opts[@]}" "${key_id_opt[@]}" -- "$helper" 2>&1)"; rc=$?
     if [[ $rc -eq 0 ]]; then hook_probe_via=key; printf '%s\n' "$out"; return 0; fi
     case "$(classify_ssh_failure "$out" "$rc")" in transport|banned) printf '%s\n' "$out"; return "$rc";; esac
   fi
@@ -1250,7 +1265,7 @@ _log_prerepo_fingerprints() {
 }
 _log_prerepo_fingerprints
 
-HOOK_LIB_SHA256="c9e29314f609c8da38a27f5fe0f4f30171db405e4842b2abeb677718145a3e74"
+HOOK_LIB_SHA256="c2aa88e19fa955b85000cf710c74cb476c7129550cf4760ac1501c79e5054157"
 HOOK_LIB_URL="${PROVISIONER_HOOK_LIB_URL:-https://raw.githubusercontent.com/thanadiosa/prometheus/main/helper-lib.sh}"
 hook_fetch_pinned_lib() {
   local try tries d tmp url="$HOOK_LIB_URL"

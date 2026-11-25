@@ -15,7 +15,11 @@ HELPER_PUT_VERIFY_MAX="${PROVISIONER_HELPER_PUT_VERIFY_MAX:-65536}"
 HELPER_CIPHERS="${PROVISIONER_HELPER_CIPHERS-aes128-ctr}"
 HELPER_MACS="${PROVISIONER_HELPER_MACS-hmac-sha2-256}"
 
-_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+_HELPER_SSH_OPTS=(-o StrictHostKeyChecking=yes -o ConnectTimeout="${HELPER_CONNECT_TIMEOUT}")
+if [ "${PROVISIONER_HELPER_TOFU:-}" = 1 ]; then
+  _HELPER_SSH_OPTS[1]="StrictHostKeyChecking=accept-new"
+  printf '[helper-lib] WARNING: PROVISIONER_HELPER_TOFU=1 - the seedbox identity is trusted on first sight, so a machine on the path gets whatever is sent to it. Record the identity and drop this.\n' >&2
+fi
 [ -n "$HELPER_CIPHERS" ] && _HELPER_SSH_OPTS+=(-o Ciphers="$HELPER_CIPHERS")
 [ -n "$HELPER_MACS" ] && _HELPER_SSH_OPTS+=(-o MACs="$HELPER_MACS")
 
@@ -169,10 +173,10 @@ _helper_sftp_run() {
   if [ "$_HELPER_AUTH" = password ]; then
     _helper_pass_run sftp \
       -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER"
+      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER"
   else
     "${to[@]}" sftp -i "$HELPER_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes \
-      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER"
+      -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER"
   fi
 }
 
@@ -226,10 +230,10 @@ _helper_ssh_raw() {
   if [ "$_HELPER_AUTH" = password ]; then
     _helper_pass_run ssh -n \
       -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" "$@"
+      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" "$@"
   else
     "${to[@]}" ssh -n -i "$HELPER_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes \
-      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" "$@"
+      -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" "$@"
   fi
 }
 
@@ -269,7 +273,7 @@ _helper_auth_probe() {
   if [ -z "$(_helper_auth_skip_reason key)" ]; then
     if printf 'quit\n' | timeout -k 5 "$HELPER_PROBE_TIMEOUT" sftp -i "$HELPER_KEY" -o IdentitiesOnly=yes \
          -o PreferredAuthentications=publickey -o BatchMode=yes \
-         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
+         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
       printf 'key'; return 0
     fi
   fi
@@ -277,7 +281,7 @@ _helper_auth_probe() {
     [ -z "${_HELPER_PROBE_ERRF:-}" ] || : > "$_HELPER_PROBE_ERRF"
     if printf 'quit\n' | _HELPER_OP_TIMEOUT="$HELPER_PROBE_TIMEOUT" _helper_pass_run sftp \
          -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
+         -P "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" >/dev/null 2>"${_HELPER_PROBE_ERRF:-/dev/null}"; then
       printf 'password'; return 0
     fi
   fi
@@ -311,6 +315,10 @@ _helper_reach() {
 
 _helper_log_no_auth() {
   local reach port_note key_skip pw_skip tried lead
+  if [ "${_HELPER_HOSTKEY_REFUSED:-0}" = 1 ]; then
+    _helper_log "the seedbox's identity is not the one recorded on this host (or none is recorded), so NOTHING was sent to it. The record comes from the fingerprint the boot hook verified; if an old entry is wrong remove it with ssh-keygen -R <seedbox name>, then record the verified key (or run the hook again with PROVISIONER_HELPER_FINGERPRINT set)."
+    return 0
+  fi
   if [ "$HELPER_PORT_SRC" = default ]; then
     port_note="port ${HELPER_PORT} is this lib's DEFAULT — nothing set PROVISIONER_HELPER_PORT for this run, so a helper listening anywhere else fails here with the credentials untouched"
   else
@@ -364,7 +372,7 @@ _helper_alias_probe() {
 helper_detect() {
   [ -n "$_HELPER_DETECTED" ] && return 0
   [ -n "$HELPER" ] || { _helper_log "HELPER (user@host) not set — cannot reach helper"; return 2; }
-  local auth errf; _HELPER_DETECT_REFUSED=0
+  local auth errf; _HELPER_DETECT_REFUSED=0; _HELPER_HOSTKEY_REFUSED=0
   errf="$(umask 077; mktemp "${TMPDIR:-/tmp}/prov-probe.XXXXXX" 2>/dev/null)" || errf=""
   _HELPER_PROBE_ERRF="$errf"
   if _helper_crypt_alias; then   # #1203: the access path signs in once, through rclone - no raw sftp/ssh probe
@@ -373,7 +381,8 @@ helper_detect() {
     auth="$_HELPER_AUTH"
   else
   auth="$(_helper_auth_probe)" || {
-    [ -z "$errf" ] || { grep -qiE "$_HELPER_AUTH_RE" "$errf" 2>/dev/null && _HELPER_DETECT_REFUSED=1; rm -f "$errf"; }
+    [ -z "$errf" ] || { grep -qiE 'host key verification failed|REMOTE HOST IDENTIFICATION' "$errf" 2>/dev/null && _HELPER_HOSTKEY_REFUSED=1
+      grep -qiE "$_HELPER_AUTH_RE" "$errf" 2>/dev/null && _HELPER_DETECT_REFUSED=1; rm -f "$errf"; }
     _HELPER_PROBE_ERRF=""; _helper_log_no_auth; return 1; }
   [ -z "$errf" ] || rm -f "$errf"
   _HELPER_PROBE_ERRF=""
@@ -429,11 +438,13 @@ _helper_crypt_hostkey() {
     || spec="$(_helper_hostspec_inline "$host" "$HELPER_PORT")" && [ -n "$spec" ] \
     || { _helper_log "crypt mode: cannot compute the known_hosts name (bootstrap/known_hosts_hostspec.sh unreadable) — refusing"; return 2; }
   ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
-  mkdir -p "$(dirname "$kh")" 2>/dev/null
-  ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o PubkeyAuthentication=no \
-      -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" "$HELPER" true >/dev/null 2>&1
-  ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
-  _helper_log "crypt mode: no host key on record for HELPER in '${kh}' and first contact did not record one — refusing to talk to an unverified host"
+  if [ "${PROVISIONER_HELPER_TOFU:-}" = 1 ]; then
+    mkdir -p "$(dirname "$kh")" 2>/dev/null
+    ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o PubkeyAuthentication=no \
+        -o UserKnownHostsFile="$kh" -p "$HELPER_PORT" "${_HELPER_SSH_OPTS[@]}" -- "$HELPER" true >/dev/null 2>&1
+    ssh-keygen -F "$spec" -f "$kh" >/dev/null 2>&1 && return 0
+  fi
+  _helper_log "crypt mode: no seedbox host key is recorded in '${kh}', so nothing is sent to it. Record the VERIFIED key: take the fingerprint from the estate's published record (the hostkey= value of its _helper.<estate> name, read through estate-connect) or from the hook that built this estate, then on this machine run: ssh-keyscan -p ${HELPER_PORT} <seedbox name> > key.txt; ssh-keygen -lf key.txt (it must print that fingerprint); cat key.txt >> '${kh}'. Or set PROVISIONER_HELPER_TOFU=1 to trust the first answer (not recommended)."
   return 2
 }
 _CRY_ALIAS_OK=""

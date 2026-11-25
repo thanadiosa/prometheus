@@ -80,15 +80,20 @@ DNS_OUT=""
 DNS_UNVERIFIED=0
 NS_LIST=""
 dns_ask() {
-  local type="$1" name="$2" ns
+  local type="$1" name="$2" ns opts
   DNS_OUT=""
   if [ -z "$NS_LIST" ]; then
     NS_LIST="$(dig +short +time=3 +tries=2 NS "$ZONE" 2>/dev/null | sed 's/\.$//' | grep -v '^$' | tr '\n' ' ')"
     [ -n "$NS_LIST" ] || NS_LIST="-"
   fi
+  # Not one packet per server (#1779): a lost UDP answer (live: ~1 in 3 from ns1) must not read as "no answer". Per
+  # server: UDP over IPv4 (3 tries), then IPv6, then TCP; a dig that exits 0 is an answer (an empty one is a real "none").
   for ns in $NS_LIST; do
     [ "$ns" = "-" ] && break
-    DNS_OUT="$(dig +short +time=3 +tries=1 "@${ns}" "$type" "$name" 2>/dev/null)" && return 0
+    for opts in "-4 +tries=3" "-6 +tries=1" "-4 +tcp +tries=1"; do
+      # shellcheck disable=SC2086
+      DNS_OUT="$(dig +short +time=3 $opts "@${ns}" "$type" "$name" 2>/dev/null)" && return 0
+    done
   done
   DNS_OUT="$(dig +short +time=3 +tries=2 "$type" "$name" 2>/dev/null)" && { DNS_UNVERIFIED=1; return 0; }
   DNS_OUT=""
@@ -460,7 +465,7 @@ cmd_umount() {
 # mirror, NEXT TO THIS FILE, and run only when its sha256 equals the value carried here. A changed file (a hijacked
 # mirror, a bad mirror run, a mover newer than this copy) is refused and named; the cure is the install line again.
 # tests/estate_laptop.sh checks this value against the committed mover, so the two cannot drift apart.
-MOVER_SHA256="29b2f3854b3e8684d20c76758f13f40e9a2dd2f21dc081b66faac3890fb088e7"
+MOVER_SHA256="b23682717fd55122ecc536fdbbd9fb640852af9256ad1174f44d07570e055eaf"
 MOVER_URL="${MIRROR_URL%/*}/dev-container-move.sh"
 
 sha256_of() {   # <file> -> the hex digest on stdout
