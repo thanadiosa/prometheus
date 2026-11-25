@@ -295,10 +295,6 @@ else
   estate=""
   log "WARN: ${ESTATE_FILE} missing (older needle snippet?) — pipeline will use its default estate"
 fi
-# #1772 (M13): the estate name becomes a secrets-folder path component; refuse anything but a plain
-# lower-case name HERE, before any path is built (the one rule: bin/new-estate.sh, the orchestrator and estate_format all use it).
-[[ -z ${estate:-} || ${estate} =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
-  || die "invalid estate name '${estate}' - must be a plain lower-case name (letters, digits, '-')"
 
 # ── THE LAP WAS STARTED FOR THE WRONG ESTATE (issue #789) ─────────────────────
 # THE BACKSTOP, not the primary check. hook.sh catches this pair on the PVE console before it

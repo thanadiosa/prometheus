@@ -23,8 +23,6 @@ REPO_DIR="${PROVISIONER_REPO_DIR:-/opt/provisioner}"
 REPO_URL="git@github.com:parrhasia/prometheus.git"
 NEEDLE_MAIN="${REPO_DIR}/bootstrap/needle.sh"       # what we hand off to
 estate="${PROVISIONER_ESTATE:-$(hostname -s 2>/dev/null || true)}"
-[[ -z ${estate:-} || ${estate} =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
-  || { printf '\n[hook] ERROR: invalid estate name %q - must be a plain lower-case name (letters, digits, -)\n' "${estate}" >&2; exit 1; }
 HELPER_AUTH_CACHE="/root/helper-auth"
 
 case "${PROVISIONER_VERBOSE:-0}" in
