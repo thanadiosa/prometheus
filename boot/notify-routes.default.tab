@@ -146,6 +146,16 @@ fleet.upgrade.report   yes  normal    -
 # The restart job's one push (#1184): machines numbered, never named.
 fleet.reboot.report    yes  normal    -
 
+# The router's nightly firmware update, run behind a snapshot (#1838): `router.update.rolledback` is an update that
+# failed its health check and was undone (the router is on its old firmware). HIGH: the estate went through a
+# failed update tonight. No address, no machine name.
+router.update.rolledback yes high    -
+# `router.update.deadman`: the update PASSED but the hypervisor's safety timer could not be cancelled, so it may undo
+# the good update. HIGH for the same reason; the line says to cancel it now.
+router.update.deadman    yes  high    -
+# `router.update.skipped`: a timer-started update found the estate busy for its whole wait and changed nothing.
+router.update.skipped    yes  normal  -
+
 # The power schedule (#1561): a machine the estate switches off and on by weeks. `power.report` is the
 # one line after a stop or a start that worked; `power.failed` is a machine that did not stop (or a
 # backup that never finished, so it was left running) or did not come back, named. HIGH: a machine
@@ -242,6 +252,10 @@ autotest.passed        yes  normal    -
 # `pipeline.failed` still owns the terminal beacon.
 opnsense.unconfigured  yes  high      -
 opnsense.health.failed yes  normal    -
+# The router started WITHOUT the admin group's sudo password rule (#1837): its first start kept going after the step that
+# writes it failed, so until the router apply of the same build runs the admin group has root with no password.
+# The operator's phone says so at once; the build then runs that apply and is not green until it has passed.
+opnsense.first-boot.rule-missing yes high -
 # The PROGRESS row for the router stage (issue #195), and the reason it is the health GATE
 # and not the tofu apply: "the router VM exists" is not a milestone anybody can act on —
 # #125 is the whole story of a router that existed and routed nothing. All three probe

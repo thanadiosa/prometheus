@@ -13,6 +13,7 @@ SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"        # the shared transport lib — the ONLY staged file we fetch
 DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy" # read-only GitHub credential (issue #10 shapes)
 VERSION_REMOTE="${_RD:+${_RD}/}version"             # the per-estate version pointer (issue #232)
+ACCEPT_CANDIDATES_REMOTE="${_RD:+${_RD}/}accept-candidates"
 HELPER_CACHE="/root/helper"                         # caches user@host
 PORT_CACHE="/root/helper-port"                      # caches the (non-22) helper port
 STATE_DIR="/etc/provisioner"                        # the boot chain's own 0700 state/secret dir
@@ -109,6 +110,29 @@ helper=""; helper_server=""; port=""; helper_src=""; port_src=""
 helper_env_used=0; helper_cache_used=0; port_env_used=0; port_cache_used=0
 helper_ok=0      # an already-validated address is not re-asked just because the port was bad
 embedded_port=""; embedded_rd=""
+HOOK_PROBE_TRIES=5
+HOOK_PROBE_WAIT_SECS=10
+HOOK_PROBE_MADE=0
+hook_tcp_probe() {   # <host> <port> - one bare TCP connect, 5 s cap (bash's /dev/tcp: no `nc` on a fresh PVE host)
+  timeout 5 bash -c 'exec 3<>/dev/tcp/"$0"/"$1"' "$1" "$2" 2>/dev/null
+}
+hook_probe_wait() {   # the wait between tries: PROVISIONER_HOOK_PROBE_WAIT if it is plain digits and at most 60, else the default
+  local w="${PROVISIONER_HOOK_PROBE_WAIT:-$HOOK_PROBE_WAIT_SECS}"
+  [[ $w =~ ^[0-9]{1,2}$ ]] && (( 10#$w <= 60 )) || w="$HOOK_PROBE_WAIT_SECS"
+  printf '%s' "$((10#$w))"
+}
+hook_first_contact() {   # <host> <port> - 0 once one try connects; 1 after all HOOK_PROBE_TRIES failed (count in HOOK_PROBE_MADE)
+  local try wait; wait="$(hook_probe_wait)"
+  for ((try = 1; try <= HOOK_PROBE_TRIES; try++)); do
+    HOOK_PROBE_MADE=$try
+    hook_tcp_probe "$1" "$2" && return 0
+    if (( try < HOOK_PROBE_TRIES )); then
+      say "helper not reachable on :${2} (try ${try} of ${HOOK_PROBE_TRIES}); trying again in ${wait} s"
+      sleep "$wait"
+    fi
+  done
+  return 1
+}
 interview_round=0
 INTERVIEW_MAX_ROUNDS="${PROVISIONER_HOOK_INTERVIEW_MAX_ROUNDS:-12}"
 [[ $INTERVIEW_MAX_ROUNDS =~ ^[0-9]+$ ]] && (( INTERVIEW_MAX_ROUNDS >= 1 )) || INTERVIEW_MAX_ROUNDS=12
@@ -181,17 +205,17 @@ Nothing has been changed on this host."
 
   [[ $helper_src != prompt ]] && log "using helper ${helper} on port ${port} (from ${helper_src})"
 
-  if ! timeout 5 bash -c "exec 3<>/dev/tcp/${helper_server}/${port}" 2>/dev/null; then
-    [[ $helper_src == env ]] && die "helper '${helper}' is unreachable on :${port} (TCP connect failed) and it came from PROVISIONER_HELPER — check the address/port/DNS and re-run. Nothing has been changed."
-    [[ $port_src == env ]] && die "helper is unreachable on :${port} (TCP connect failed) and that port came from PROVISIONER_HELPER_PORT — check the address/port/DNS and re-run. Nothing has been changed."
+  if ! hook_first_contact "$helper_server" "$port"; then
+    [[ $helper_src == env ]] && die "helper '${helper}' is unreachable on :${port} (TCP connect failed, ${HOOK_PROBE_MADE} tries) and it came from PROVISIONER_HELPER — check the address/port/DNS and re-run. Nothing has been changed."
+    [[ $port_src == env ]] && die "helper is unreachable on :${port} (TCP connect failed, ${HOOK_PROBE_MADE} tries) and that port came from PROVISIONER_HELPER_PORT — check the address/port/DNS and re-run. Nothing has been changed."
     if [[ $have_tty == 1 ]]; then
-      say "helper unreachable on :${port} — re-enter"
+      say "helper unreachable on :${port} after ${HOOK_PROBE_MADE} tries — re-enter"
       rm -f "$HELPER_CACHE" "$PORT_CACHE"
       helper_cache_used=1; port_cache_used=1     # belt-and-braces if the rm could not happen
       helper_ok=0                                # the address itself may be what is wrong
       continue
     fi
-    die "helper unreachable on :${port} (TCP connect failed) and no controlling terminal to re-ask on — check the address/port/DNS and re-run. Nothing has been changed."
+    die "helper unreachable on :${port} (TCP connect failed, ${HOOK_PROBE_MADE} tries) and no controlling terminal to re-ask on — check the address/port/DNS and re-run. Nothing has been changed."
   fi
   break
 done
@@ -263,7 +287,15 @@ Nothing has been changed on this host."
       || die "the saved identity for the seedbox differs from the fingerprint given, so the password is NOT sent. Remove the old entry with: ssh-keygen -R '${spec}' and run again."
   fi
   tmp="$(umask 077; mktemp)" || die "cannot make a scratch file for the helper host key"
-  ssh-keyscan -T 10 -p "$port" "$helper_server" > "$tmp" 2>/dev/null || true
+  local ks_try
+  for ((ks_try = 1; ks_try <= HOOK_PROBE_TRIES; ks_try++)); do
+    ssh-keyscan -T 10 -p "$port" "$helper_server" > "$tmp" 2>/dev/null || true
+    [[ -s $tmp ]] && break
+    if (( ks_try < HOOK_PROBE_TRIES )); then
+      say "helper showed no host key on :${port} (try ${ks_try} of ${HOOK_PROBE_TRIES}); trying again in $(hook_probe_wait) s"
+      sleep "$(hook_probe_wait)"
+    fi
+  done
   while IFS= read -r line; do
     [[ -z $line || $line == \#* ]] && continue
     got="$(ssh-keygen -lf /dev/stdin <<<"$line" 2>/dev/null | awk '{print $2}')"
@@ -510,6 +542,7 @@ SECRETS_REMOTE="${_RD:+${_RD}/}secrets"
 LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
 DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy"
 VERSION_REMOTE="${_RD:+${_RD}/}version"
+ACCEPT_CANDIDATES_REMOTE="${_RD:+${_RD}/}accept-candidates"   # beside the pointer, so it follows the same finalized layout (#1791)
 
 foreign_estate_dir() {
   local est="${1:-}" rd="${2:-}" last parent
@@ -1174,6 +1207,7 @@ Nothing has been fetched or changed. Fix the cause, or name the directory: re-ru
     LIB_REMOTE="${SCRIPTS_REMOTE}/helper-lib.sh"
     DEPLOY_KEY_REMOTE="${SECRETS_REMOTE}/github_deploy"
     VERSION_REMOTE="${_RD:+${_RD}/}version"
+    ACCEPT_CANDIDATES_REMOTE="${_RD:+${_RD}/}accept-candidates"
     RD_PROBE=0
     [[ $hook_probe_via == key && -n $keep ]] && hook_note_verified_id "$out"
     [[ -n $keep ]] && hook_probe_have_lib=1
@@ -1545,6 +1579,142 @@ elif [[ -d "${REPO_DIR}/.git" ]] && ! git -C "$REPO_DIR" symbolic-ref --quiet HE
 A locally modified file stops it. Inspect ${REPO_DIR}, or remove it and re-run the hook to clone fresh."
   unset _newest
 fi
+
+HOOK_RELEASE_SIGNERS="$(printf '%s\n' \
+  'release-signer-b ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAvrcTcKsT2ObIgB0XNc1Ui0tgY7VJxelZxhXPQT+i0v' \
+  'release-signer-c ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFScXABmjMwGYwdM0faS75E9HVT9lC1KEyqo0hR+IxYN')"
+
+HOOK_CANDIDATE_SIGNERS="$(printf '%s\n' \
+  'release-signer-a ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEcjxr8HRPqDwjGGSmmU2HwjGVeqlTjFB+yEd7YIX1j/')"
+
+_vbc_tag_ok() {   # <repo_dir> <allowed-signers file> <gate|candidate> <full sha> -> rc 0, or the reason on stdout and rc 1
+  local d="$1" allowed="$2" kind="$3" sha="$4" tag raw hobj htype hname vout vco slot msg
+  local -a G=(git -C "$d" -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  tag="${kind}/${sha}"
+  "${G[@]}" fetch --quiet --force origin "+refs/tags/${tag}:refs/tags/${tag}" >/dev/null 2>&1 || true
+  [[ "$("${G[@]}" cat-file -t "refs/tags/${tag}" 2>/dev/null)" == tag ]] \
+    || { echo "there is no signed (annotated) tag ${tag} for this commit"; return 1; }
+  raw="$("${G[@]}" cat-file tag "refs/tags/${tag}" 2>/dev/null)" || { echo "cannot read tag ${tag}"; return 1; }
+  hobj="$(sed -n '1s/^object //p' <<<"$raw")"; htype="$(sed -n '2s/^type //p' <<<"$raw")"; hname="$(sed -n '3s/^tag //p' <<<"$raw")"
+  [[ $htype == commit && $hobj == "$sha" && $hname == "$tag" ]] \
+    || { echo "tag ${tag} does not name exactly this commit (it names ${htype:-?} ${hobj:-?} as ${hname:-?})"; return 1; }
+  [[ "$("${G[@]}" rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" == "$sha" ]] \
+    || { echo "tag ${tag} does not resolve to this commit"; return 1; }
+  vout="$("${G[@]}" -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.program=false -c gpg.x509.program=false -c "gpg.ssh.allowedSignersFile=${allowed}" verify-tag "refs/tags/${tag}" 2>&1)" \
+    || {
+      if [[ $kind == gate && -s "$(dirname "$allowed")/allowed-candidate-only" ]]; then
+        vco="$("${G[@]}" -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.program=false -c gpg.x509.program=false -c "gpg.ssh.allowedSignersFile=$(dirname "$allowed")/allowed-candidate-only" verify-tag "refs/tags/${tag}" 2>&1)" \
+          && { slot="$(sed -n 's/^Good .* signature for \([A-Za-z0-9][A-Za-z0-9._@-]*\) with .*/\1/p' <<<"$vco" | head -n 1)"
+               echo "tag ${tag} is signed by ${slot:-a candidate-only key}, a CANDIDATE-ONLY signer: that key may sign candidate tags, never a gate tag"; return 1; }
+      fi
+      echo "the signature on tag ${tag} is not from a release key: $(tr '\n' ' ' <<<"$vout" | cut -c1-160)"; return 1; }
+  msg="$(sed -n '/^$/,$p' <<<"$raw" | sed '/^-----BEGIN SSH SIGNATURE-----$/,$d')"
+  if [[ $kind == candidate ]]; then
+    ! grep -qx 'mutants=all' <<<"$msg" && grep -qx "candidate ${sha}" <<<"$msg" && grep -q 'CANDIDATE tag, not a gate pass' <<<"$msg" \
+      || { echo "tag ${tag} is not a plain candidate tag (it must say it is a candidate and not a gate pass, and never mutants=all)"; return 1; }
+  else
+    grep -qx 'mutants=all' <<<"$msg" \
+      || { echo "tag ${tag} does not say mutants=all, so its gate run did not check every suite's break-tests"; return 1; }
+  fi
+  return 0
+}
+
+_vbc_judge() {   # <repo_dir> <allowed-signers file of the RELEASE keys; its folder also holds allowed-candidate and allowed-candidate-only>
+  local d="$1" allowed="$2" sha kind why ok="" reasons="" rr lv st ignf
+  local -a G=(git -C "$d" -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  sha="$("${G[@]}" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" && [[ $sha =~ ^[0-9a-f]{40}$ ]] \
+    || { echo "the checkout has no readable commit"; return 1; }
+  for kind in gate candidate; do
+    if why="$(_vbc_tag_ok "$d" "$([[ $kind == candidate ]] && echo "$(dirname "$allowed")/allowed-candidate" || echo "$allowed")" "$kind" "$sha")"; then
+      if [[ $kind == candidate ]] && ! _vbc_candidates_allowed; then
+        reasons+="${reasons:+; }the commit has a valid candidate tag, but this estate builds gate tags only (it is not marked as a test estate)"; continue
+      fi
+      ok="$kind"; break
+    fi
+    reasons+="${reasons:+; }${why}"
+  done
+  [[ -n $ok ]] || { echo "$reasons"; return 1; }
+  rr="$("${G[@]}" for-each-ref refs/replace 2>/dev/null)" || { echo "git could not list the replace refs of ${d}, so the checkout cannot be judged"; return 1; }
+  [[ -z $rr ]] \
+    || { echo "the checkout carries replace refs, which can swap what git shows for what is signed"; return 1; }
+  "${G[@]}" diff-index --quiet HEAD -- 2>/dev/null || { echo "a tracked file in ${d} differs from the signed commit"; return 1; }
+  lv="$("${G[@]}" ls-files -v 2>/dev/null)" || { echo "git could not list the files of ${d}, so a hidden change cannot be ruled out"; return 1; }
+  [[ -z "$(grep -v '^H ' <<<"$lv")" ]] \
+    || { echo "a file in ${d} is hidden from git's change check (assume-unchanged / skip-worktree)"; return 1; }
+  st="$("${G[@]}" status --porcelain --untracked-files=all 2>/dev/null)" || { echo "git could not read the state of ${d}, so the checkout cannot be judged"; return 1; }
+  [[ -z $st ]] \
+    || { echo "${d} holds files that are not in the signed commit"; return 1; }
+  ignf="$(dirname "$allowed")/ignored-files"   # the list goes through a file in the scratch folder so the command's own exit status can be read
+  "${G[@]}" ls-files -z -o -i --exclude-standard > "$ignf" 2>/dev/null || { echo "git could not list the ignored files of ${d}, so a runnable leftover cannot be ruled out"; return 1; }
+  while IFS= read -r -d '' ign; do
+    if [[ $ign =~ \.(sh|bash|py|pl|rb)$ || -x "${d}/${ign}" ]]; then
+      echo "${d} holds an ignored file that could be run and is not in the signed commit"; return 1
+    fi
+  done < "$ignf"
+  echo "$ok"
+  return 0
+}
+
+verify_build_commit() {   # <repo_dir> → rc 0 only for a commit backed by a release-signed tag (prints gate or candidate); else the reason on stdout, rc 1
+  local d="$1" scratch allowed line n=0 rc gmaj gmin
+  export GIT_NO_REPLACE_OBJECTS=1
+  unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE
+  command -v ssh-keygen >/dev/null 2>&1 || { echo "ssh-keygen is not installed, so no signature can be checked"; return 1; }
+  read -r gmaj gmin < <(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+  { [[ ${gmaj:-0} -gt 2 ]] || { [[ ${gmaj:-0} -eq 2 && ${gmin:-0} -ge 34 ]]; }; } \
+    || { echo "git ${gmaj:-?}.${gmin:-?} on this host is older than 2.34 and cannot verify ssh signatures; install a newer git (Debian 12 and Proxmox VE 8 carry one)"; return 1; }
+  scratch="$(mktemp -d)" || { echo "no scratch folder for the signer list"; return 1; }
+  chmod 0700 "$scratch"
+  allowed="${scratch}/allowed-signers"; : > "$allowed"; : > "${scratch}/allowed-candidate-only"
+  local seen="" key name
+  while IFS= read -r line; do
+    if [[ $line =~ ^([A-Za-z0-9][A-Za-z0-9._@-]*)[[:space:]]+ssh-ed25519[[:space:]]+(AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]+=*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; key="${BASH_REMATCH[2]}"
+      case " $seen " in *" $key "*) rm -rf "$scratch"; echo "the signer key of ${name} is listed twice (a key may be on one list only); this hook refuses every commit until that is fixed"; return 1 ;; esac
+      seen+="$key "
+      printf '%s namespaces="git" ssh-ed25519 %s\n' "$name" "$key" >> "$allowed"; n=$((n + 1))
+    fi
+  done <<< "$HOOK_RELEASE_SIGNERS"
+  while IFS= read -r line; do
+    if [[ $line =~ ^([A-Za-z0-9][A-Za-z0-9._@-]*)[[:space:]]+ssh-ed25519[[:space:]]+(AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]+=*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; key="${BASH_REMATCH[2]}"
+      case " $seen " in *" $key "*) rm -rf "$scratch"; echo "the signer key of ${name} is on both the release list and the candidate-only list (or listed twice); this hook refuses every commit until that is fixed"; return 1 ;; esac
+      seen+="$key "
+      printf '%s namespaces="git" ssh-ed25519 %s\n' "$name" "$key" >> "${scratch}/allowed-candidate-only"
+    fi
+  done <<< "${HOOK_CANDIDATE_SIGNERS:-}"
+  cat "$allowed" "${scratch}/allowed-candidate-only" > "${scratch}/allowed-candidate"
+  if (( n == 0 )); then echo "this hook carries no release keys"; rc=1
+  else _vbc_judge "$d" "$allowed"; rc=$?; fi
+  rm -rf "$scratch"
+  return $rc
+}
+
+_vbc_candidates_allowed() {   # rc 0 only when the helper's marker says exactly `candidates`
+  local t; t="$(mktemp)" || return 1
+  if helper_get "$ACCEPT_CANDIDATES_REMOTE" "$t" 2>/dev/null && [[ "$(head -n 1 "$t" | tr -d '[:space:]')" == candidates ]]; then rm -f "$t"; return 0; fi
+  rm -f "$t"; return 1
+}
+export GIT_NO_REPLACE_OBJECTS=1   # in THIS shell too (the call below is a subshell): every later git call, the needle's included, reads real objects only
+if ! _sig_why="$(verify_build_commit "$REPO_DIR")"; then
+  die "the commit to be built is not signed by the release key (${_sig_why}).
+Nothing from the checkout was run and nothing has been provisioned. Build a version that was cut (or a commit
+the release signers have signed, which the gate does when a whole run passes): set the version pointer on the
+helper, or PROVISIONER_VERSION, to it, and re-run the hook."
+fi
+_build_kind="${_sig_why:-}"   # gate | candidate: which signed tag backed the commit (empty only where a test suite turned the gate off)
+unset _sig_why
+if [[ $_build_kind == candidate ]]; then
+  say "THIS IS A CANDIDATE BUILD: commit $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null) is signed as a candidate by a release signer, which is NOT a passed gate run. This estate accepts candidates because it is a test estate."
+  log "build commit $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null) carries a release-signed CANDIDATE tag (not a gate pass) — running from it"
+else
+  log "build commit $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null) carries a release-signed gate tag — running from it"
+fi
+PROVISIONER_BUILD_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+export PROVISIONER_BUILD_COMMIT
+PROVISIONER_BUILD_TAG_KIND=gate; [[ $_build_kind == candidate ]] && PROVISIONER_BUILD_TAG_KIND=candidate
+export PROVISIONER_BUILD_TAG_KIND
+unset _build_kind
 
 if [[ -n $PROVISIONER_VERSION && -r $NEEDLE_MAIN ]] \
    && command -v grep >/dev/null 2>&1 \

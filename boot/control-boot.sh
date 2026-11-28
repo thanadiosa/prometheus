@@ -116,6 +116,12 @@ CONTROL_INIT="${REPO_DIR}/bootstrap/control-init.sh"   # what we hand off to
 # produces. That degradation is the graceful-degrade contract working: a missing artifact keeps
 # the previous behaviour rather than failing.
 VERSION_FILE="${STATE_DIR}/version"
+# THE FULL COMMIT ID THE PVE HOST VERIFIED (review M4): needle.sh writes it into the same cloud-init snippet, from the value hook.sh
+# checked the release signature of. The label above is only a NAME and can be moved between the PVE host's resolution and this
+# node's; the id cannot. Absent / `none` (a snippet from before this existed, or a needle run by hand) keeps today's behaviour,
+# said out loud, and the signature check below still applies to whatever commit ends up checked out.
+BUILD_COMMIT_FILE="${STATE_DIR}/build-commit"
+BUILD_TAG_KIND_FILE="${STATE_DIR}/build-tag-kind"   # which kind of signed tag the PVE host verified: gate | candidate (#1791)
 
 # Helper-side root (must match what is placed on the helper "starter" area).
 # Same REMOTE_DIR root as needle.sh; secrets live under it, never in git. needle.sh
@@ -347,6 +353,14 @@ SECRETS_REMOTE="${REMOTE_DIR:+${REMOTE_DIR}/}secrets"
 DEPLOY_KEY_REMOTE="${SECRETS_REMOTE:+${SECRETS_REMOTE}/}github_deploy"
 
 install -d -m 0700 "$STATE_DIR" "$SSH_DIR"
+
+# The engine's state root, made HERE, before any role can make it by accident (#1830). Every folder under it keeps
+# its own mode (0700 for the private ones), but a role that creates a 0700 sub-folder of a root that does not exist
+# yet makes the ROOT 0700 too (ansible's `file` gives every folder it has to create the leaf's mode; `mkdir -p` does
+# the same under umask 077). That is how a control node's state root came to be 0700 from its first build, shutting
+# the build agent (an account of its own since #1754) out of the lock folder below it. 0711 = pass-through only:
+# nothing in it is listable, and the sub-folders guard themselves. Runs as root (first boot), so root-owned.
+install -d -m 0711 /var/lib/provisioner
 
 # ── 1. The helper credential: INJECTED at first boot, never baked (issue #151) ─
 # The image used to carry it — a baked /root/.ssh/id_ed25519 or a baked helper-pass — which
@@ -605,6 +619,200 @@ elif ! git -C "$REPO_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
 A locally modified file stops it. Inspect ${REPO_DIR}, or remove it and reboot this node to clone fresh."
   unset _newest
 fi
+
+# ── THE COMMIT RUN HERE IS THE ONE THE PVE HOST VERIFIED, AND IT IS SIGNED (review M4) ──────────────────────────────
+# This node clones the repository AGAIN and runs the checkout as root on the machine that holds the vault password, so it needs
+# the same two protections the hook has. (1) The commit is the full id the PVE host verified, not whatever the label resolves to
+# now. (2) That commit must carry a gate tag signed by one of the release keys. The verification below is the hook's, copied
+# byte for byte (tests/control_boot_build_signature.sh holds the two copies identical): neither file can source the other, both
+# run before the checkout they judge exists. This script runs once per control node (the chain's once-only stamp), so no
+# already-running node is affected by it; a node whose cloud-init predates this check has no id file and is judged by (2) alone.
+_handed=""
+if [[ -n ${PROVISIONER_BUILD_COMMIT:-} ]]; then _handed="$PROVISIONER_BUILD_COMMIT"
+elif [[ -f $BUILD_COMMIT_FILE ]]; then _handed="$(head -n 1 "$BUILD_COMMIT_FILE" | tr -d '[:space:]')"; fi
+if [[ $_handed =~ ^[0-9a-f]{40}$ ]]; then
+  if [[ -n $PROVISIONER_VERSION ]]; then
+    _label_sha="$(resolve_ref "$REPO_DIR" "$PROVISIONER_VERSION")" || _label_sha=""
+    [[ $_label_sha == "$_handed" ]] \
+      || die "the version '${PROVISIONER_VERSION}' now points at ${_label_sha:-nothing} but the PVE host verified and built ${_handed}.
+The name moved between the two steps. NOT building either: the control node runs exactly the commit that was verified.
+Nothing has been provisioned on this node. Fix the version (or retry the whole lap) once it is stable."
+  fi
+  git -C "$REPO_DIR" cat-file -e "${_handed}^{commit}" 2>/dev/null \
+    || die "the commit the PVE host verified (${_handed}) is not in the clone this node made, so it cannot be built here.
+Nothing has been provisioned on this node."
+  git -C "$REPO_DIR" checkout --detach "$_handed" \
+    || die "could not check out the verified commit ${_handed} in ${REPO_DIR}.
+git refuses a checkout that would overwrite a locally modified file. Inspect ${REPO_DIR}, or remove it and reboot this node to clone fresh."
+  log "checkout set to the commit the PVE host verified: ${_handed}"
+else
+  log "WARN: no verified commit id was handed over by the PVE host (${BUILD_COMMIT_FILE} absent or 'none') - building what the version resolves to; the release-signature check below still applies"
+fi
+unset _handed _label_sha
+# WHICH KIND OF TAG THE PVE HOST VERIFIED, handed down like the id (#1791): this node accepts a candidate tag only when the host did, and the
+# host did only for an estate whose own helper says it is a test estate. Nothing handed, junk, or `gate` = gate tags only (an older needle).
+_handed_kind=""
+if [[ -n ${PROVISIONER_BUILD_TAG_KIND:-} ]]; then _handed_kind="$PROVISIONER_BUILD_TAG_KIND"
+elif [[ -f ${BUILD_TAG_KIND_FILE:-/nonexistent} ]]; then _handed_kind="$(head -n 1 "$BUILD_TAG_KIND_FILE" | tr -d '[:space:]')"; fi
+_vbc_candidates_allowed() { [[ $_handed_kind == candidate ]]; }
+
+HOOK_RELEASE_SIGNERS="$(printf '%s\n' \
+  'release-signer-b ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAvrcTcKsT2ObIgB0XNc1Ui0tgY7VJxelZxhXPQT+i0v' \
+  'release-signer-c ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFScXABmjMwGYwdM0faS75E9HVT9lC1KEyqo0hR+IxYN')"
+
+# THE SECOND LIST: CANDIDATE-ONLY signers (#1833). The coding container's key (release-signer-a) signs candidate tags every day, so it is
+# the key that is handled most often; it is accepted for `candidate/<sha>` ONLY. A gate tag signed with it is refused on every estate, test
+# estate or not, with a reason naming the slot. The two lists are disjoint: a key on both is a mistake in this file and refuses EVERY
+# commit (fail closed), as does a key listed twice. A key is moved between the lists, or withdrawn, by editing the blocks and
+# re-publishing the mirror (docs/handbook/BUILD-SIGNATURE.md). Withdraw the last one by leaving the block with no key line: then no
+# key is candidate-only (a hook with no candidate-only key still builds gate tags).
+HOOK_CANDIDATE_SIGNERS="$(printf '%s\n' \
+  'release-signer-a ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEcjxr8HRPqDwjGGSmmU2HwjGVeqlTjFB+yEd7YIX1j/')"
+
+# ONE KIND OF TAG, judged: the tag gate/<sha> (a whole green gate run) or candidate/<sha> (a release signer froze the commit for a
+# test build). Same call for both: the tag must be annotated, name exactly this commit under exactly its own name, and verify against
+# the carried keys. A candidate's message must also say it is a CANDIDATE and must not say mutants=all, so a gate tag can never be
+# passed off as a candidate nor the other way round (the header's own name is signed; a tag moved to another name does not count).
+_vbc_tag_ok() {   # <repo_dir> <allowed-signers file> <gate|candidate> <full sha> -> rc 0, or the reason on stdout and rc 1
+  local d="$1" allowed="$2" kind="$3" sha="$4" tag raw hobj htype hname vout vco slot msg
+  local -a G=(git -C "$d" -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  tag="${kind}/${sha}"
+  # the tag is looked for fresh (it may have been made after this checkout was cloned); a failed fetch just leaves what is there to be judged
+  "${G[@]}" fetch --quiet --force origin "+refs/tags/${tag}:refs/tags/${tag}" >/dev/null 2>&1 || true
+  [[ "$("${G[@]}" cat-file -t "refs/tags/${tag}" 2>/dev/null)" == tag ]] \
+    || { echo "there is no signed (annotated) tag ${tag} for this commit"; return 1; }
+  raw="$("${G[@]}" cat-file tag "refs/tags/${tag}" 2>/dev/null)" || { echo "cannot read tag ${tag}"; return 1; }
+  hobj="$(sed -n '1s/^object //p' <<<"$raw")"; htype="$(sed -n '2s/^type //p' <<<"$raw")"; hname="$(sed -n '3s/^tag //p' <<<"$raw")"
+  [[ $htype == commit && $hobj == "$sha" && $hname == "$tag" ]] \
+    || { echo "tag ${tag} does not name exactly this commit (it names ${htype:-?} ${hobj:-?} as ${hname:-?})"; return 1; }
+  [[ "$("${G[@]}" rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" == "$sha" ]] \
+    || { echo "tag ${tag} does not resolve to this commit"; return 1; }
+  # (for a candidate the caller hands the file of release AND candidate-only keys; for a gate tag the file of RELEASE keys alone (#1833))
+  vout="$("${G[@]}" -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.program=false -c gpg.x509.program=false -c "gpg.ssh.allowedSignersFile=${allowed}" verify-tag "refs/tags/${tag}" 2>&1)" \
+    || {
+      # a gate tag that fails the release keys may still be signed by a candidate-only key: say so plainly, by the slot's name
+      if [[ $kind == gate && -s "$(dirname "$allowed")/allowed-candidate-only" ]]; then
+        vco="$("${G[@]}" -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.program=false -c gpg.x509.program=false -c "gpg.ssh.allowedSignersFile=$(dirname "$allowed")/allowed-candidate-only" verify-tag "refs/tags/${tag}" 2>&1)" \
+          && { slot="$(sed -n 's/^Good .* signature for \([A-Za-z0-9][A-Za-z0-9._@-]*\) with .*/\1/p' <<<"$vco" | head -n 1)"
+               echo "tag ${tag} is signed by ${slot:-a candidate-only key}, a CANDIDATE-ONLY signer: that key may sign candidate tags, never a gate tag"; return 1; }
+      fi
+      echo "the signature on tag ${tag} is not from a release key: $(tr '\n' ' ' <<<"$vout" | cut -c1-160)"; return 1; }
+  # the signed message is what sits between the header's blank line and the signature block; it is signed, so it cannot be edited
+  msg="$(sed -n '/^$/,$p' <<<"$raw" | sed '/^-----BEGIN SSH SIGNATURE-----$/,$d')"
+  if [[ $kind == candidate ]]; then
+    ! grep -qx 'mutants=all' <<<"$msg" && grep -qx "candidate ${sha}" <<<"$msg" && grep -q 'CANDIDATE tag, not a gate pass' <<<"$msg" \
+      || { echo "tag ${tag} is not a plain candidate tag (it must say it is a candidate and not a gate pass, and never mutants=all)"; return 1; }
+  else
+    # A GATE tag counts only when its run checked every suite's break-tests: bin/gate-tag-check.sh refuses a gate record without the
+    # line mutants=all for the version cut, and a box must hold the same line (a signature by a release key on a run that skipped the
+    # break-tests, or on a hand-made tag with another message, proves less than the gate says) (#1791)
+    grep -qx 'mutants=all' <<<"$msg" \
+      || { echo "tag ${tag} does not say mutants=all, so its gate run did not check every suite's break-tests"; return 1; }
+  fi
+  return 0
+}
+
+# the judging, with the scratch folder already made: on success prints which kind of tag backed the commit (gate or candidate) and
+# returns 0; otherwise prints the reason and returns 1. A candidate tag counts only when _vbc_candidates_allowed says so (a test estate,
+# defined by each script from its own trusted source; see docs/handbook/BUILD-SIGNATURE.md), and a gate tag is always tried first.
+_vbc_judge() {   # <repo_dir> <allowed-signers file of the RELEASE keys; its folder also holds allowed-candidate and allowed-candidate-only>
+  local d="$1" allowed="$2" sha kind why ok="" reasons="" rr lv st ignf
+  local -a G=(git -C "$d" -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  sha="$("${G[@]}" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" && [[ $sha =~ ^[0-9a-f]{40}$ ]] \
+    || { echo "the checkout has no readable commit"; return 1; }
+  for kind in gate candidate; do
+    # a gate tag is judged against the RELEASE keys alone; a candidate against release + candidate-only (#1833)
+    if why="$(_vbc_tag_ok "$d" "$([[ $kind == candidate ]] && echo "$(dirname "$allowed")/allowed-candidate" || echo "$allowed")" "$kind" "$sha")"; then
+      # a valid candidate tag counts only on a test estate; that question is asked (of the helper, on the hypervisor) only now, so a build
+      # that has a gate tag, and a build with no valid tag at all, cost no extra login
+      if [[ $kind == candidate ]] && ! _vbc_candidates_allowed; then
+        reasons+="${reasons:+; }the commit has a valid candidate tag, but this estate builds gate tags only (it is not marked as a test estate)"; continue
+      fi
+      ok="$kind"; break
+    fi
+    reasons+="${reasons:+; }${why}"
+  done
+  [[ -n $ok ]] || { echo "$reasons"; return 1; }
+  # the tree on disk is exactly the signed commit's
+  # every one of these asks git a question, and a question git could not answer is NOT the answer "nothing found": the command's own exit
+  # status is read first and a failure refuses (an empty output from a failed command used to read as a clean tree)
+  rr="$("${G[@]}" for-each-ref refs/replace 2>/dev/null)" || { echo "git could not list the replace refs of ${d}, so the checkout cannot be judged"; return 1; }
+  [[ -z $rr ]] \
+    || { echo "the checkout carries replace refs, which can swap what git shows for what is signed"; return 1; }
+  "${G[@]}" diff-index --quiet HEAD -- 2>/dev/null || { echo "a tracked file in ${d} differs from the signed commit"; return 1; }
+  lv="$("${G[@]}" ls-files -v 2>/dev/null)" || { echo "git could not list the files of ${d}, so a hidden change cannot be ruled out"; return 1; }
+  [[ -z "$(grep -v '^H ' <<<"$lv")" ]] \
+    || { echo "a file in ${d} is hidden from git's change check (assume-unchanged / skip-worktree)"; return 1; }
+  st="$("${G[@]}" status --porcelain --untracked-files=all 2>/dev/null)" || { echo "git could not read the state of ${d}, so the checkout cannot be judged"; return 1; }
+  [[ -z $st ]] \
+    || { echo "${d} holds files that are not in the signed commit"; return 1; }
+  # IGNORED leftovers (a re-run on a checkout an earlier lap used): git status does not list them, and a script an earlier,
+  # unchecked lap left behind in an ignored name would sit in the tree this lap runs from. Generated DATA the build legitimately
+  # leaves in the checkout (.materialized/, .terraform/, key files) is not refused; anything a shell or interpreter could run is:
+  # a script suffix, or any file with an execute bit.
+  ignf="$(dirname "$allowed")/ignored-files"   # the list goes through a file in the scratch folder so the command's own exit status can be read
+  "${G[@]}" ls-files -z -o -i --exclude-standard > "$ignf" 2>/dev/null || { echo "git could not list the ignored files of ${d}, so a runnable leftover cannot be ruled out"; return 1; }
+  while IFS= read -r -d '' ign; do
+    if [[ $ign =~ \.(sh|bash|py|pl|rb)$ || -x "${d}/${ign}" ]]; then
+      echo "${d} holds an ignored file that could be run and is not in the signed commit"; return 1
+    fi
+  done < "$ignf"
+  echo "$ok"
+  return 0
+}
+
+verify_build_commit() {   # <repo_dir> → rc 0 only for a commit backed by a release-signed tag (prints gate or candidate); else the reason on stdout, rc 1
+  local d="$1" scratch allowed line n=0 rc gmaj gmin
+  export GIT_NO_REPLACE_OBJECTS=1
+  # the verdict comes from git's own ssh-keygen against the carried keys and from nothing the caller's environment can inject: git reads extra
+  # configuration from these variables (a gpg.ssh.program that always says yes would be one), and GIT_DIR/GIT_WORK_TREE would point every
+  # call below at another repository. This runs in a subshell, so the caller's environment is untouched; no caller needs any of them.
+  unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE
+  command -v ssh-keygen >/dev/null 2>&1 || { echo "ssh-keygen is not installed, so no signature can be checked"; return 1; }
+  # ssh signatures in git (gpg.format=ssh, allowedSignersFile, verify-tag) arrived in git 2.34; an older git cannot judge the tag at all
+  read -r gmaj gmin < <(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+  { [[ ${gmaj:-0} -gt 2 ]] || { [[ ${gmaj:-0} -eq 2 && ${gmin:-0} -ge 34 ]]; }; } \
+    || { echo "git ${gmaj:-?}.${gmin:-?} on this host is older than 2.34 and cannot verify ssh signatures; install a newer git (Debian 12 and Proxmox VE 8 carry one)"; return 1; }
+  scratch="$(mktemp -d)" || { echo "no scratch folder for the signer list"; return 1; }
+  chmod 0700 "$scratch"
+  allowed="${scratch}/allowed-signers"; : > "$allowed"; : > "${scratch}/allowed-candidate-only"
+  local seen="" key name
+  while IFS= read -r line; do
+    # exactly "<name> ssh-ed25519 <base64 key>"; anything else (a placeholder included) is not a key and counts for nothing
+    if [[ $line =~ ^([A-Za-z0-9][A-Za-z0-9._@-]*)[[:space:]]+ssh-ed25519[[:space:]]+(AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]+=*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; key="${BASH_REMATCH[2]}"
+      case " $seen " in *" $key "*) rm -rf "$scratch"; echo "the signer key of ${name} is listed twice (a key may be on one list only); this hook refuses every commit until that is fixed"; return 1 ;; esac
+      seen+="$key "
+      printf '%s namespaces="git" ssh-ed25519 %s\n' "$name" "$key" >> "$allowed"; n=$((n + 1))
+    fi
+  done <<< "$HOOK_RELEASE_SIGNERS"
+  while IFS= read -r line; do
+    if [[ $line =~ ^([A-Za-z0-9][A-Za-z0-9._@-]*)[[:space:]]+ssh-ed25519[[:space:]]+(AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]+=*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; key="${BASH_REMATCH[2]}"
+      case " $seen " in *" $key "*) rm -rf "$scratch"; echo "the signer key of ${name} is on both the release list and the candidate-only list (or listed twice); this hook refuses every commit until that is fixed"; return 1 ;; esac
+      seen+="$key "
+      printf '%s namespaces="git" ssh-ed25519 %s\n' "$name" "$key" >> "${scratch}/allowed-candidate-only"
+    fi
+  done <<< "${HOOK_CANDIDATE_SIGNERS:-}"
+  # the candidate file = release keys + candidate-only keys
+  cat "$allowed" "${scratch}/allowed-candidate-only" > "${scratch}/allowed-candidate"
+  if (( n == 0 )); then echo "this hook carries no release keys"; rc=1
+  else _vbc_judge "$d" "$allowed"; rc=$?; fi
+  rm -rf "$scratch"
+  return $rc
+}
+
+export GIT_NO_REPLACE_OBJECTS=1
+if ! _sig_why="$(verify_build_commit "$REPO_DIR")"; then
+  die "the commit to be built is not signed by the release key (${_sig_why}).
+Nothing from the checkout was run and nothing has been provisioned on this node."
+fi
+_build_kind="${_sig_why:-}"
+unset _sig_why
+if [[ $_build_kind == candidate ]]; then
+  log "WARNING: THIS IS A CANDIDATE BUILD: this node builds a commit signed only as a candidate by a release signer, which is NOT a passed gate run (the PVE host's estate is a test estate)."
+fi
+unset _build_kind
 
 [[ -r $CONTROL_INIT ]] \
   || die "the checkout at ${REPO_DIR} has no bootstrap/control-init.sh — either the clone is incomplete or this commit predates the split of the boot logic into the repo.
